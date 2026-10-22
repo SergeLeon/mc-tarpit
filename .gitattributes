@@ -7,3 +7,8 @@
 *.conf text eol=lf
 *.md text eol=lf
 *.yml text eol=lf
+
+# release archive (git archive / releases/latest download): keep the installer,
+# the tool and contrib/, drop CI and tests noise
+/.github    export-ignore
+/tests      export-ignore
