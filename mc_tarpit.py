@@ -1,50 +1,62 @@
 #!/usr/bin/env python3
 """mc-tarpit - drop Minecraft bots that probe your server.
 
-Works as a passive side channel: tcpdump hands over copies of packets that go
-to the Minecraft port, the tool parses the handshake and the Login Start, and
-decides whether the source IP may talk to the server at all. Offenders are put
-into nftables sets, the kernel then silently drops their traffic. Nothing is
-ever inserted into the live connection path, so a bug can lose a decision but
-never a player: every failure mode is fail-open.
+A passive sniffer watches the Minecraft ports, parses the handshake and the
+`Login Start` packet, and decides whether a source may talk to the server.
+Offenders land in nftables sets that silently drop their traffic, so scanners
+cannot even tell the server is alive. Nothing is inserted into the live
+connection path: tcpdump hands over copies, the kernel enforces. Every failure
+mode is fail-open, a broken parse never blocks anybody.
 
-Decision table
---------------
+Decisions
+---------
 
-    login, name in whitelist.json / ops.json
-        -> allowed, IP remembered in the trusted list for TRUST_TTL
-    login, name unknown
-        -> IP goes to set `tarpit` for TARPIT_TTL
-    status ping from an IP that never logged in with a known name
-        -> IP goes to set `pingsink` for PING_TTL
-    everything else
-        -> ignored
+    source IP matches trust_subnets            -> always allowed, ignored
+    login, name in whitelist/ops/names file    -> allowed, IP trusted for trust_ttl
+    login, unknown name                        -> tarpit set, tarpit_ttl
+    status ping, IP not trusted                -> pingsink set, ping_ttl
+    login_policy = log                         -> unknown logins are only logged
+    ping_policy  = ignore                      -> pings are never acted upon
 
-Status pings carry no username, so a stranger's very first ping is always
-answered (the reply is already on the wire when we see the packet). Every
-following connection from that IP is dropped, which is what keeps the server
-out of bot server lists.
-
-Configuration
--------------
-
-All settings come from environment variables, see `CONFIG` below. The only
-mandatory one is the server directory, because that is where
-`whitelist.json` and `ops.json` live.
+Both IPv4 and IPv6 are supported, any number of ports, and the configuration
+can come from a file, the environment and the command line (in that order of
+increasing precedence).
 
 Usage
 -----
 
     mc_tarpit.py watch                 # run as a service
-    mc_tarpit.py selftest              # parser self-check, no network
-    mc_tarpit.py ping                  # send a status ping to the server
-    mc_tarpit.py login NAME            # send a login attempt with NAME
-    mc_tarpit.py status                # show nftables sets and trusted IPs
+    mc_tarpit.py status                # effective config, sets, trusted IPs
+    mc_tarpit.py selftest              # offline parser self-check
+    mc_tarpit.py replay FILE.pcap      # replay a capture, print decisions
+    mc_tarpit.py ping  [--host H]      # send a status ping
+    mc_tarpit.py login NAME [--host H] # send a login attempt
+    mc_tarpit.py trust IP...           # add IPs to the trusted list
+    mc_tarpit.py untrust IP...         # remove them
 
-Exit codes: 0 ok, 1 configuration/permission problem.
+Configuration keys (config file, `MC_TARPIT_<KEY>` env, `--<key>` CLI):
+
+    server_dir      dir with whitelist.json / ops.json      (default: .)
+    ports           comma separated Minecraft ports         (default: 25565)
+    mode            drop | log                              (default: drop)
+    ping_policy     sink | ignore                           (default: sink)
+    login_policy    tarpit | log                            (default: tarpit)
+    tarpit_ttl      nftables timeout for unknown logins     (default: 1d)
+    ping_ttl        nftables timeout for untrusted pings    (default: 15m)
+    trust_ttl       seconds an IP stays trusted             (default: 2592000)
+    trust_file      trusted IP list, relative to server_dir (default: tarpit-trusted.json)
+    names_file      extra allowed nicknames, one per line   (default: tarpit-names.txt)
+    trust_subnets   CIDRs that are never blocked            (default: empty)
+    table           nftables table name                     (default: mc_tarpit)
+    iface           capture interface                       (default: any)
+    protocol        protocol version for the test clients   (default: 776)
+    log_level       debug | info | warn                     (default: info)
+    log_file        append log lines to this file           (default: stdout)
 """
 
 import argparse
+import configparser
+import ipaddress
 import json
 import os
 import socket
@@ -53,47 +65,157 @@ import subprocess
 import sys
 import time
 
-CONFIG = {
-    # directory with whitelist.json and ops.json
-    'server_dir': os.environ.get('MC_TARPIT_SERVER_DIR', '.'),
-    # public Minecraft port to watch
-    'port': int(os.environ.get('MC_TARPIT_PORT', '25565')),
-    # 'drop' (real nftables drops) or 'log' (dry run)
-    'mode': os.environ.get('MC_TARPIT_MODE', 'drop'),
-    # nftables table and sets
-    'table': os.environ.get('MC_TARPIT_TABLE', 'mc_tarpit'),
-    'tarpit_set': 'tarpit',
-    'pingsink_set': 'pingsink',
-    # how long an offender stays blocked
-    'tarpit_ttl': os.environ.get('MC_TARPIT_TARPIT_TTL', '1d'),
-    'ping_ttl': os.environ.get('MC_TARPIT_PING_TTL', '15m'),
-    # how long an IP that logged in with a known name is trusted
-    'trust_ttl': int(os.environ.get('MC_TARPIT_TRUST_TTL', str(30 * 86400))),
-    'trust_file': os.environ.get('MC_TARPIT_TRUST_FILE', 'tarpit-trusted.json'),
-    # capture interface; 'any' is fine on Linux
-    'iface': os.environ.get('MC_TARPIT_IFACE', 'any'),
-    # protocol version used by the built-in test clients
-    'protocol': int(os.environ.get('MC_TARPIT_PROTOCOL', '776')),
-    # forget half-parsed flows after this many seconds
-    'flow_ttl': 60.0,
-    'max_buf': 4096,
+VERSION = '0.2.0'
+
+DEFAULTS = {
+    'server_dir': '.',
+    'ports': '25565',
+    'mode': 'drop',
+    'ping_policy': 'sink',
+    'login_policy': 'tarpit',
+    'tarpit_ttl': '1d',
+    'ping_ttl': '15m',
+    'trust_ttl': '2592000',
+    'trust_file': 'tarpit-trusted.json',
+    'names_file': 'tarpit-names.txt',
+    'trust_subnets': '',
+    'table': 'mc_tarpit',
+    'iface': 'any',
+    'protocol': '776',
+    'log_level': 'info',
+    'log_file': '',
 }
+
+CHOICES = {
+    'mode': ('drop', 'log'),
+    'ping_policy': ('sink', 'ignore'),
+    'login_policy': ('tarpit', 'log'),
+    'log_level': ('debug', 'info', 'warn'),
+}
+
+LOG_LEVELS = {'debug': 0, 'info': 1, 'warn': 2}
+
+PROTO_LOGIN = 2
 
 PCAP_LINKTYPE_EN10MB = 1
 PCAP_LINKTYPE_SLL = 113
 PCAP_LINKTYPE_SLL2 = 276
-
-IPV4_ETHERTYPE = 0x0800
+ETHERTYPE_IPV4 = 0x0800
+ETHERTYPE_IPV6 = 0x86DD
 TCP_PROTO = 6
 SYN_FLAG = 0x02
-LOGIN_STATE = 2
+
+STATE = {'level': 1, 'file': ''}
+
+
+# --------------------------------------------------------------------------
+# logging
+# --------------------------------------------------------------------------
+def setup_log(cfg):
+    STATE['level'] = LOG_LEVELS[cfg['log_level']]
+    STATE['file'] = cfg['log_file']
+
+
+def log(message, level='info'):
+    if LOG_LEVELS[level] < STATE['level']:
+        return
+    line = '%s %s' % (time.strftime('%Y-%m-%d %H:%M:%S'), message)
+    if STATE['file']:
+        try:
+            with open(STATE['file'], 'a', encoding='utf-8') as fh:
+                fh.write(line + '\n')
+            return
+        except OSError:
+            pass
+    print(line, flush=True)
+
+
+# --------------------------------------------------------------------------
+# configuration
+# --------------------------------------------------------------------------
+def read_config_file(path):
+    """Read an INI file, any section name, only known keys are used."""
+    parser = configparser.ConfigParser()
+    if not parser.read(path):
+        raise SystemExit('config file not readable: %s' % path)
+    values = {}
+    for section in parser.sections():
+        for key, value in parser.items(section):
+            key = key.replace('-', '_')
+            if key in DEFAULTS:
+                values[key] = value
+    return values
+
+
+def load_config(config_path=None, overrides=None):
+    """defaults < config file < environment < command line"""
+    cfg = dict(DEFAULTS)
+    path = config_path or os.environ.get('MC_TARPIT_CONFIG')
+    if path:
+        cfg.update(read_config_file(path))
+    for key in DEFAULTS:
+        env = 'MC_TARPIT_' + key.upper()
+        if env in os.environ:
+            cfg[key] = os.environ[env]
+    if 'MC_TARPIT_PORT' in os.environ and 'MC_TARPIT_PORTS' not in os.environ:
+        cfg['ports'] = os.environ['MC_TARPIT_PORT']
+    for key, value in (overrides or {}).items():
+        if value is not None and key in DEFAULTS:
+            cfg[key] = value
+    return normalize(cfg)
+
+
+def normalize(cfg):
+    ports = str(cfg['ports']).replace(',', ' ').split()
+    try:
+        cfg['ports'] = sorted({int(p) for p in ports})
+    except ValueError:
+        raise SystemExit('ports must be numbers: %r' % cfg['ports'])
+    if not cfg['ports']:
+        raise SystemExit('at least one port is required')
+    for key in ('trust_ttl', 'protocol'):
+        try:
+            cfg[key] = int(cfg[key])
+        except ValueError:
+            raise SystemExit('%s must be an integer: %r' % (key, cfg[key]))
+    for key, allowed in CHOICES.items():
+        if cfg[key] not in allowed:
+            raise SystemExit('%s must be one of %s, got %r'
+                             % (key, '/'.join(allowed), cfg[key]))
+    subnets = []
+    for item in str(cfg['trust_subnets']).replace(',', ' ').split():
+        try:
+            subnets.append(ipaddress.ip_network(item, strict=False))
+        except ValueError:
+            raise SystemExit('bad subnet in trust_subnets: %r' % item)
+    cfg['subnets'] = subnets
+    return cfg
+
+
+def describe_config(cfg):
+    rows = [('server_dir', cfg['server_dir']),
+            ('ports', ','.join(str(p) for p in cfg['ports'])),
+            ('mode', cfg['mode']),
+            ('ping_policy', cfg['ping_policy']),
+            ('login_policy', cfg['login_policy']),
+            ('tarpit_ttl', cfg['tarpit_ttl']),
+            ('ping_ttl', cfg['ping_ttl']),
+            ('trust_ttl', '%d s' % cfg['trust_ttl']),
+            ('trust_file', trust_path(cfg)),
+            ('names_file', names_path(cfg)),
+            ('trust_subnets', ','.join(str(s) for s in cfg['subnets']) or '-'),
+            ('table', cfg['table']),
+            ('iface', cfg['iface']),
+            ('protocol', cfg['protocol']),
+            ('log_level', cfg['log_level']),
+            ('log_file', cfg['log_file'] or '-')]
+    return rows
 
 
 # --------------------------------------------------------------------------
 # Minecraft protocol
 # --------------------------------------------------------------------------
 def read_varint(buf, pos):
-    """Decode a VarInt, return (value, new_pos) or (None, pos) when truncated."""
     value = 0
     shift = 0
     while True:
@@ -110,12 +232,11 @@ def read_varint(buf, pos):
 
 
 def parse_client_stream(buf):
-    """Parse handshake plus Login Start from the start of a client stream.
+    """(next_state, name, raw_login) from handshake + Login Start.
 
-    Returns (next_state, name, raw_login):
-        (None, None, None) - not enough bytes yet
-        (1, None, None)    - status ping, no username available
-        (2, name, raw)     - login attempt
+    (None, None, None) - not enough bytes yet
+    (1, None, None)    - status ping
+    (2, name, raw)     - login attempt
     """
     pos = 0
     length, pos = read_varint(buf, pos)
@@ -125,21 +246,20 @@ def parse_client_stream(buf):
     if len(buf) < end:
         return None, None, None
 
-    pid, q = read_varint(buf, pos)
+    pid, cursor = read_varint(buf, pos)
     if pid != 0:
         return None, None, None
-    _, q = read_varint(buf, q)          # protocol version
-    addr_len, q = read_varint(buf, q)
+    _, cursor = read_varint(buf, cursor)
+    addr_len, cursor = read_varint(buf, cursor)
     if addr_len is None:
         return None, None, None
-    q += addr_len + 2                   # server address + port
-    next_state, q = read_varint(buf, q)
+    cursor += addr_len + 2
+    next_state, cursor = read_varint(buf, cursor)
     if next_state is None:
         return None, None, None
-    if next_state != LOGIN_STATE:
+    if next_state != PROTO_LOGIN:
         return next_state, None, None
 
-    # Login Start: id 0x00, name (1..16 bytes), then the client UUID
     pos = end
     length, pos = read_varint(buf, pos)
     if length is None:
@@ -147,14 +267,13 @@ def parse_client_stream(buf):
     if len(buf) < pos + length:
         return None, None, None
     raw = buf[pos:pos + length]
-    pid, q = read_varint(raw, 0)
+    pid, cursor = read_varint(raw, 0)
     if pid != 0:
         return None, None, None
-    name_len, q = read_varint(raw, q)
+    name_len, cursor = read_varint(raw, cursor)
     if name_len is None or name_len > 16:
         return None, None, None
-    name = raw[q:q + name_len].decode('utf-8', 'replace')
-    return LOGIN_STATE, name, raw[:40]
+    return PROTO_LOGIN, raw[cursor:cursor + name_len].decode('utf-8', 'replace'), raw[:40]
 
 
 def encode_varint(value):
@@ -168,7 +287,7 @@ def encode_varint(value):
             return out + bytes([byte])
 
 
-def handshake(next_state, host='127.0.0.1', port=25565, protocol=776):
+def handshake(next_state, host, port, protocol):
     body = encode_varint(0) + encode_varint(protocol) + encode_varint(len(host))
     body += host.encode() + struct.pack('>H', port) + encode_varint(next_state)
     return encode_varint(len(body)) + body
@@ -177,34 +296,49 @@ def handshake(next_state, host='127.0.0.1', port=25565, protocol=776):
 # --------------------------------------------------------------------------
 # packet parsing
 # --------------------------------------------------------------------------
-def packet_payload(linktype, frame):
-    """Return (src_ip, src_port, seq, flags, tcp_payload) for IPv4/TCP to our port."""
+def _transport_offset(linktype, frame):
+    """Return (ethertype, ip_offset) for a frame, or (None, 0)."""
     if linktype == PCAP_LINKTYPE_SLL2:
-        offset = 20
-        if struct.unpack('>H', frame[0:2])[0] != IPV4_ETHERTYPE:
+        if len(frame) < 22:
+            return None, 0
+        return struct.unpack('>H', frame[0:2])[0], 20
+    if linktype == PCAP_LINKTYPE_EN10MB:
+        if len(frame) < 14:
+            return None, 0
+        return struct.unpack('>H', frame[12:14])[0], 14
+    if linktype == PCAP_LINKTYPE_SLL:
+        if len(frame) < 16:
+            return None, 0
+        return struct.unpack('>H', frame[14:16])[0], 16
+    return None, 0
+
+
+def packet_payload(linktype, frame, ports):
+    """(src_ip, src_port, seq, flags, payload) for TCP to one of our ports.
+
+    IPv6 extension headers are not followed: a packet with one is ignored.
+    """
+    ethertype, offset = _transport_offset(linktype, frame)
+    if ethertype == ETHERTYPE_IPV4:
+        ip = frame[offset:]
+        if len(ip) < 20 or (ip[0] >> 4) != 4 or ip[9] != TCP_PROTO:
             return None
-    elif linktype == PCAP_LINKTYPE_EN10MB:
-        offset = 14
-        if struct.unpack('>H', frame[12:14])[0] != IPV4_ETHERTYPE:
+        header_len = (ip[0] & 0x0F) * 4
+        src_ip = socket.inet_ntoa(ip[12:16])
+        tcp = ip[header_len:]
+    elif ethertype == ETHERTYPE_IPV6:
+        ip = frame[offset:]
+        if len(ip) < 40 or (ip[0] >> 4) != 6 or ip[6] != TCP_PROTO:
             return None
-    elif linktype == PCAP_LINKTYPE_SLL:
-        offset = 16
-        if struct.unpack('>H', frame[14:16])[0] != IPV4_ETHERTYPE:
-            return None
+        src_ip = socket.inet_ntop(socket.AF_INET6, ip[8:24])
+        tcp = ip[40:]
     else:
         return None
 
-    ip = frame[offset:]
-    if len(ip) < 20 or (ip[0] >> 4) != 4 or ip[9] != TCP_PROTO:
-        return None
-    header_len = (ip[0] & 0x0F) * 4
-    src_ip = socket.inet_ntoa(ip[12:16])
-
-    tcp = ip[header_len:]
     if len(tcp) < 20:
         return None
     src_port, dst_port = struct.unpack('>HH', tcp[0:4])
-    if dst_port != CONFIG['port']:
+    if dst_port not in ports:
         return None
     seq = struct.unpack('>I', tcp[4:8])[0]
     flags = tcp[13]
@@ -213,19 +347,18 @@ def packet_payload(linktype, frame):
 
 
 def read_pcap_frames(stream):
-    """Yield (linktype, frame) from a classic pcap stream."""
+    """Yield (linktype, frame) from a classic pcap file given as bytes."""
     header = stream[:24]
     if len(header) < 24:
         return
-    magic = header[:4]
-    endian = '<' if magic in (b'\xd4\xc3\xb2\xa1', b'\x4d\x3c\xb2\xa1') else '>'
+    endian = '<' if header[:4] in (b'\xd4\xc3\xb2\xa1', b'\x4d\x3c\xb2\xa1') else '>'
     linktype = struct.unpack(endian + 'I', header[20:24])[0]
     stream = stream[24:]
     while True:
-        ph = stream[:16]
-        if len(ph) < 16:
+        record = stream[:16]
+        if len(record) < 16:
             return
-        incl_len = struct.unpack(endian + 'I', ph[8:12])[0]
+        incl_len = struct.unpack(endian + 'I', record[8:12])[0]
         frame = stream[16:16 + incl_len]
         if len(frame) < incl_len:
             return
@@ -234,40 +367,54 @@ def read_pcap_frames(stream):
 
 
 # --------------------------------------------------------------------------
-# whitelist and trusted IPs
+# names and trusted IPs
 # --------------------------------------------------------------------------
-def allowed_names(server_dir):
-    """Names from whitelist.json and ops.json, lowercased."""
+def names_path(cfg):
+    path = cfg['names_file']
+    return path if os.path.isabs(path) else os.path.join(cfg['server_dir'], path)
+
+
+def trust_path(cfg):
+    path = cfg['trust_file']
+    return path if os.path.isabs(path) else os.path.join(cfg['server_dir'], path)
+
+
+def allowed_names(cfg):
+    """Nicknames from whitelist.json, ops.json and the extra names file."""
     names = set()
     for filename in ('whitelist.json', 'ops.json'):
         try:
-            with open(os.path.join(server_dir, filename), encoding='utf-8') as fh:
+            with open(os.path.join(cfg['server_dir'], filename), encoding='utf-8') as fh:
                 for item in json.load(fh):
                     name = item.get('name')
                     if name:
                         names.add(name.lower())
         except (OSError, ValueError):
             continue
+    try:
+        with open(names_path(cfg), encoding='utf-8') as fh:
+            for line in fh:
+                line = line.split('#', 1)[0].strip()
+                if line:
+                    names.add(line.lower())
+    except OSError:
+        pass
     return names
 
 
-def trust_path(server_dir):
-    path = CONFIG['trust_file']
-    return path if os.path.isabs(path) else os.path.join(server_dir, path)
-
-
-def load_trusted(server_dir):
+def load_trusted(cfg):
     try:
-        with open(trust_path(server_dir), encoding='utf-8') as fh:
+        with open(trust_path(cfg), encoding='utf-8') as fh:
             data = json.load(fh)
     except (OSError, ValueError):
         return {}
     now = time.time()
-    return {ip: expiry for ip, expiry in data.items() if expiry > now}
+    return {ip: expiry for ip, expiry in data.items()
+            if isinstance(expiry, (int, float)) and expiry > now}
 
 
-def save_trusted(server_dir, data):
-    path = trust_path(server_dir)
+def save_trusted(cfg, data):
+    path = trust_path(cfg)
     tmp = path + '.tmp'
     with open(tmp, 'w', encoding='utf-8') as fh:
         json.dump(data, fh, indent=2, sort_keys=True)
@@ -279,58 +426,136 @@ def is_trusted(data, ip, now=None):
     return (now or time.time()) < data.get(ip, 0)
 
 
+def is_ignored(subnets, ip):
+    try:
+        address = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return any(address in subnet for subnet in subnets)
+
+
 # --------------------------------------------------------------------------
 # nftables
 # --------------------------------------------------------------------------
-def nft_add(set_name, ip, ttl):
-    if CONFIG['mode'] != 'drop':
+def nft_set_name(kind, ip):
+    return kind + ('6' if ':' in ip else '')
+
+
+def nft_add(cfg, kind, ip, ttl):
+    if cfg['mode'] != 'drop':
         return True
-    cmd = ['nft', 'add', 'element', 'inet', CONFIG['table'], set_name,
+    set_name = nft_set_name(kind, ip)
+    cmd = ['nft', 'add', 'element', 'inet', cfg['table'], set_name,
            '{', ip, 'timeout', ttl, '}']
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        print('nft %s failed for %s: %s' % (set_name, ip, result.stderr.strip()))
+        log('nft %s failed for %s: %s' % (set_name, ip, result.stderr.strip()), 'warn')
         return False
     return True
 
 
-# --------------------------------------------------------------------------
-# watcher
-# --------------------------------------------------------------------------
-def watch():
-    cmd = ['tcpdump', '-i', CONFIG['iface'], '-n', '-s', '0', '-U', '-w', '-',
-           'tcp dst port %d' % CONFIG['port']]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
-    stream = proc.stdout
+def tarpit(cfg, ip, ttl):
+    log('tarpit %s -> %s %s' % (ip, nft_set_name('tarpit', ip), ttl))
+    nft_add(cfg, 'tarpit', ip, ttl)
 
-    header = stream.read(24)
+
+def ping_sink(cfg, ip):
+    log('ping %s -> %s %s (not trusted)' % (ip, nft_set_name('pingsink', ip), cfg['ping_ttl']))
+    nft_add(cfg, 'pingsink', ip, cfg['ping_ttl'])
+
+
+# --------------------------------------------------------------------------
+# decision making (shared by watch and replay)
+# --------------------------------------------------------------------------
+class Decider:
+    """Turn parsed streams into actions, with the config cached."""
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.names = allowed_names(cfg)
+        self.names_at = time.time()
+        self.trusted = load_trusted(cfg)
+        self.trusted_at = time.time()
+
+    def refresh(self, now):
+        if now - self.names_at > 30:
+            self.names = allowed_names(self.cfg)
+            self.names_at = now
+        if now - self.trusted_at > 300:
+            self.trusted = load_trusted(self.cfg)
+            self.trusted_at = now
+
+    def decide(self, ip, state, name):
+        cfg = self.cfg
+        now = time.time()
+        self.refresh(now)
+
+        if is_ignored(cfg['subnets'], ip):
+            log('ignore %s (trust_subnets)' % ip, 'debug')
+            return 'ignore'
+
+        if name is None:
+            if cfg['ping_policy'] == 'ignore':
+                log('ping %s (ping_policy=ignore)' % ip, 'debug')
+                return 'ignore'
+            if is_trusted(self.trusted, ip):
+                log('ping %s (trusted)' % ip, 'debug')
+                return 'allow'
+            ping_sink(cfg, ip)
+            return 'pingsink'
+
+        known = name.lower() in self.names
+        log('login %s name=%r %s' % (ip, name, 'ok' if known else 'not-whitelisted'))
+        if known:
+            if not is_trusted(self.trusted, ip):
+                self.trusted[ip] = now + cfg['trust_ttl']
+                save_trusted(cfg, self.trusted)
+                self.trusted_at = now
+                log('trust %s (%ds)' % (ip, cfg['trust_ttl']))
+            return 'allow'
+        if cfg['login_policy'] == 'log':
+            log('login %s ignored (login_policy=log)' % ip)
+            return 'ignore'
+        tarpit(cfg, ip, cfg['tarpit_ttl'])
+        return 'tarpit'
+
+
+# --------------------------------------------------------------------------
+# watching live traffic
+# --------------------------------------------------------------------------
+def tcpdump_filter(ports):
+    return ' or '.join('tcp dst port %d' % port for port in ports)
+
+
+def watch(cfg):
+    cmd = ['tcpdump', '-i', cfg['iface'], '-n', '-s', '0', '-U',
+           '-w', '-', tcpdump_filter(cfg['ports'])]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+
+    header = proc.stdout.read(24)
     if len(header) < 24:
-        print('tcpdump did not start')
+        log('tcpdump did not start', 'warn')
         return 1
-    magic = header[:4]
-    endian = '<' if magic in (b'\xd4\xc3\xb2\xa1', b'\x4d\x3c\xb2\xa1') else '>'
+    endian = '<' if header[:4] in (b'\xd4\xc3\xb2\xa1', b'\x4d\x3c\xb2\xa1') else '>'
     linktype = struct.unpack(endian + 'I', header[20:24])[0]
 
-    server_dir = CONFIG['server_dir']
-    names = allowed_names(server_dir)
-    names_at = time.time()
-    trusted = load_trusted(server_dir)
-    trusted_at = time.time()
+    decider = Decider(cfg)
+    ports = set(cfg['ports'])
     flows = {}
-
-    print('watching port %d, mode=%s, linktype=%d, trusted=%d'
-          % (CONFIG['port'], CONFIG['mode'], linktype, len(trusted)))
+    log('watching ports=%s mode=%s ping_policy=%s login_policy=%s linktype=%d trusted=%d'
+        % (','.join(str(p) for p in cfg['ports']), cfg['mode'], cfg['ping_policy'],
+           cfg['login_policy'], linktype, len(decider.trusted)))
 
     while True:
-        ph = stream.read(16)
-        if len(ph) < 16:
+        record = proc.stdout.read(16)
+        if len(record) < 16:
             break
-        incl_len = struct.unpack(endian + 'I', ph[8:12])[0]
-        frame = stream.read(incl_len)
+        incl_len = struct.unpack(endian + 'I', record[8:12])[0]
+        frame = proc.stdout.read(incl_len)
         if len(frame) < incl_len:
             break
 
-        packet = packet_payload(linktype, frame)
+        packet = packet_payload(linktype, frame, ports)
         if not packet:
             continue
         src, src_port, seq, flags, payload = packet
@@ -344,11 +569,10 @@ def watch():
             flows[key] = {'buf': bytearray(), 'seq': seq + 1,
                           'at': now, 'done': False}
             continue
-
         flow = flows.get(key)
         if flow is None:
             continue
-        if now - flow['at'] > CONFIG['flow_ttl']:
+        if now - flow['at'] > 60:
             del flows[key]
             continue
         flow['at'] = now
@@ -357,7 +581,7 @@ def watch():
 
         expected = flow['seq'] + len(flow['buf'])
         if seq == expected:
-            room = CONFIG['max_buf'] - len(flow['buf'])
+            room = 4096 - len(flow['buf'])
             flow['buf'] += payload[:room]
         elif seq > expected:
             flow['done'] = True
@@ -369,123 +593,166 @@ def watch():
         if state is None:
             continue
         flow['done'] = True
-
-        if now - names_at > 30:
-            names = allowed_names(server_dir)
-            names_at = now
-        if now - trusted_at > 300:
-            trusted = load_trusted(server_dir)
-            trusted_at = now
-
-        if name is None:
-            if not is_trusted(trusted, src):
-                print('ping %s:%d -> %s %s (not trusted)'
-                      % (src, src_port, CONFIG['pingsink_set'], CONFIG['ping_ttl']))
-                nft_add(CONFIG['pingsink_set'], src, CONFIG['ping_ttl'])
-            continue
-
-        known = name.lower() in names
-        print('login %s:%d name=%r %s raw=%s'
-              % (src, src_port, name, 'ok' if known else 'not-whitelisted', raw.hex()))
-        if known:
-            if not is_trusted(trusted, src):
-                trusted[src] = now + CONFIG['trust_ttl']
-                save_trusted(server_dir, trusted)
-                trusted_at = now
-                print('trust %s (%ds)' % (src, CONFIG['trust_ttl']))
-        else:
-            nft_add(CONFIG['tarpit_set'], src, CONFIG['tarpit_ttl'])
+        if raw:
+            log('raw %s name=%r %s' % (src, name, raw.hex()), 'debug')
+        decider.decide(src, state, name)
 
         if len(flows) > 5000:
-            for stale in [k for k, v in flows.items() if now - v['at'] > CONFIG['flow_ttl']]:
+            for stale in [k for k, v in flows.items() if now - v['at'] > 60]:
                 del flows[stale]
 
     return 0
 
 
+def replay(cfg, path):
+    """Run the decision logic over a saved capture, without touching nftables."""
+    log_only = dict(cfg)
+    log_only['mode'] = 'log'
+    # keep the output one line per connection: the summary below says enough
+    setup_log(dict(log_only, log_level='warn'))
+    decider = Decider(log_only)
+    ports = set(log_only['ports'])
+    with open(path, 'rb') as fh:
+        data = fh.read()
+    flows = {}
+    for linktype, frame in read_pcap_frames(data):
+        packet = packet_payload(linktype, frame, ports)
+        if not packet:
+            continue
+        src, src_port, seq, flags, payload = packet
+        now = time.time()
+        key = (src, src_port)
+        if flags & SYN_FLAG:
+            flows[key] = {'buf': bytearray(), 'seq': seq + 1, 'done': False}
+            continue
+        flow = flows.get(key)
+        if flow is None or flow['done']:
+            continue
+        expected = flow['seq'] + len(flow['buf'])
+        if seq == expected:
+            flow['buf'] += payload[:4096 - len(flow['buf'])]
+        elif seq > expected:
+            flow['done'] = True
+            continue
+        else:
+            continue
+        state, name, _ = parse_client_stream(bytes(flow['buf']))
+        if state is None:
+            continue
+        flow['done'] = True
+        decision = decider.decide(src, state, name)
+        print('%s %s%s' % (src, 'login ' + name if name else 'ping', ' -> ' + decision))
+    return 0
+
+
 # --------------------------------------------------------------------------
-# test clients and status
+# status
 # --------------------------------------------------------------------------
-def send_login(name, host='127.0.0.1', port=None):
-    port = port or CONFIG['port']
+def show_status(cfg):
+    print('mc-tarpit %s' % VERSION)
+    print('config:')
+    for key, value in describe_config(cfg):
+        print('  %-14s %s' % (key, value))
+    for kind in ('tarpit', 'pingsink'):
+        for family in ('', '6'):
+            set_name = kind + family
+            result = subprocess.run(
+                ['nft', 'list', 'set', 'inet', cfg['table'], set_name],
+                capture_output=True, text=True)
+            if result.returncode != 0:
+                continue
+            print('%s:' % set_name)
+            for line in result.stdout.splitlines():
+                line = line.strip()
+                if line.startswith('elements') or line.startswith('timeout'):
+                    print('  ' + line)
+    trusted = load_trusted(cfg)
+    print('trusted (%d):' % len(trusted))
+    for ip, expiry in sorted(trusted.items()):
+        left = max(0, int(expiry - time.time()))
+        print('  %-40s %dd%02dh' % (ip, left // 86400, left % 86400 // 3600))
+    names = allowed_names(cfg)
+    print('allowed names (%d): %s' % (len(names), ', '.join(sorted(names)) or '-'))
+    print('trust_subnets: %s' % (', '.join(str(s) for s in cfg['subnets']) or '-'))
+    return 0
+
+
+# --------------------------------------------------------------------------
+# test clients
+# --------------------------------------------------------------------------
+def send_login(cfg, name, host='127.0.0.1', port=None):
+    port = port or cfg['ports'][0]
     login = encode_varint(0) + encode_varint(len(name)) + name.encode() + b'\x00' * 16
     sock = socket.create_connection((host, port), timeout=5)
-    sock.sendall(handshake(2, host, port, CONFIG['protocol'])
+    sock.sendall(handshake(2, host, port, cfg['protocol'])
                  + encode_varint(len(login)) + login)
     time.sleep(1)
     sock.close()
     print('sent login as %r to %s:%d' % (name, host, port))
 
 
-def send_ping(host='127.0.0.1', port=None):
-    port = port or CONFIG['port']
+def send_ping(cfg, host='127.0.0.1', port=None):
+    port = port or cfg['ports'][0]
     sock = socket.create_connection((host, port), timeout=5)
-    sock.sendall(handshake(1, host, port, CONFIG['protocol'])
+    sock.sendall(handshake(1, host, port, cfg['protocol'])
                  + encode_varint(1) + encode_varint(0))
     time.sleep(1)
     sock.close()
     print('sent status ping to %s:%d' % (host, port))
 
 
-def show_status():
-    for set_name in (CONFIG['tarpit_set'], CONFIG['pingsink_set']):
-        cmd = ['nft', 'list', 'set', 'inet', CONFIG['table'], set_name]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            print('%s: %s' % (set_name, result.stderr.strip() or 'unavailable'))
-            continue
-        print('%s:' % set_name)
-        for line in result.stdout.splitlines():
-            if 'elements' in line or 'timeout' in line:
-                print('  ' + line.strip())
-    trusted = load_trusted(CONFIG['server_dir'])
-    print('trusted (%d):' % len(trusted))
-    for ip, expiry in sorted(trusted.items()):
-        left = int(expiry - time.time())
-        print('  %s  %dd%02dh' % (ip, left // 86400, left % 86400 // 3600))
-
-
 # --------------------------------------------------------------------------
 # self-test
 # --------------------------------------------------------------------------
-def sll2_frame(src_ip, src_port, seq, payload, dst_ip='192.168.0.19'):
-    ip = b'\x45\x00' + struct.pack('>H', 20 + 20 + len(payload)) + b'\x00\x00\x00\x00'
-    ip += b'\x40\x06\x00\x00' + socket.inet_aton(src_ip) + socket.inet_aton(dst_ip)
-    tcp = struct.pack('>HHII', src_port, CONFIG['port'], seq, 0)
-    tcp += b'\x50\x18\xff\xff\x00\x00\x00\x00'
-    return struct.pack('>H', IPV4_ETHERTYPE) + b'\x00' * 18 + ip + tcp + payload
+def sll2_frame(ethertype, payload, src_ip=None, src_port=50000, seq=1000,
+               dst_ip='192.168.0.19'):
+    if ethertype == ETHERTYPE_IPV4:
+        ip = b'\x45\x00' + struct.pack('>H', 20 + 20 + len(payload)) + b'\x00\x00\x00\x00'
+        ip += b'\x40\x06\x00\x00'
+        ip += socket.inet_aton(src_ip) + socket.inet_aton(dst_ip)
+        tcp = struct.pack('>HHII', src_port, 25565, seq, 0)
+        tcp += b'\x50\x18\xff\xff\x00\x00\x00\x00'
+    else:
+        ip = b'\x60\x00\x00\x00' + struct.pack('>H', 20 + len(payload)) + b'\x06\x40'
+        ip += socket.inet_pton(socket.AF_INET6, src_ip)
+        ip += socket.inet_pton(socket.AF_INET6, '2001:db8::1')
+        tcp = struct.pack('>HHII', src_port, 25565, seq, 0)
+        tcp += b'\x50\x18\xff\xff\x00\x00\x00\x00'
+    return struct.pack('>H', ethertype) + b'\x00' * 18 + ip + tcp + payload
 
 
-def selftest():
-    """Offline check of the parser: no sniffing, no network, no nftables."""
+def selftest(cfg):
+    """Offline check of the parser and the decision helpers."""
     host = '127.0.0.1'
-    hs = (encode_varint(0) + encode_varint(CONFIG['protocol'])
+    hs = (encode_varint(0) + encode_varint(cfg['protocol'])
           + encode_varint(len(host)) + host.encode()
-          + struct.pack('>H', CONFIG['port']) + encode_varint(2))
+          + struct.pack('>H', 25565) + encode_varint(2))
     login = encode_varint(0) + encode_varint(7) + b'TestBot' + b'\x00' * 16
     stream = encode_varint(len(hs)) + hs + encode_varint(len(login)) + login
 
     pcap = b'\xd4\xc3\xb2\xa1' + b'\x02\x00\x04\x00' + b'\x00' * 8
     pcap += b'\xff\xff\x00\x00' + struct.pack('<I', PCAP_LINKTYPE_SLL2)
     for offset in (0, 20, 40):
-        frame = sll2_frame('203.0.113.9', 50000, 1000 + offset, stream[offset:offset + 20])
+        frame = sll2_frame(ETHERTYPE_IPV4, stream[offset:offset + 20],
+                           src_ip='203.0.113.9', seq=1000 + offset)
         pcap += struct.pack('<IIII', 0, 0, len(frame), len(frame)) + frame
 
+    ports = set(cfg['ports'])
     reassembled = b''
     name = None
     for linktype, frame in read_pcap_frames(pcap):
-        packet = packet_payload(linktype, frame)
+        packet = packet_payload(linktype, frame, ports)
         assert packet, 'frame was not parsed'
         reassembled += packet[4]
-        state, name, _ = parse_client_stream(reassembled)
+        _, name, _ = parse_client_stream(reassembled)
         if name:
             break
     assert name == 'TestBot', 'expected TestBot, parsed %r' % (name,)
     print('ok: login start parse -> %r' % name)
 
-    status = (encode_varint(0) + encode_varint(CONFIG['protocol'])
+    status = (encode_varint(0) + encode_varint(cfg['protocol'])
               + encode_varint(len(host)) + host.encode()
-              + struct.pack('>H', CONFIG['port']) + encode_varint(1))
+              + struct.pack('>H', 25565) + encode_varint(1))
     state, _, _ = parse_client_stream(encode_varint(len(status)) + status + b'\x01\x00')
     assert state == 1, 'status ping misparsed: %r' % (state,)
     print('ok: status ping recognised')
@@ -498,66 +765,141 @@ def selftest():
     assert state is None, 'garbage must not produce a login'
     print('ok: garbage rejected')
 
-    names = allowed_names(CONFIG['server_dir'])
+    ipv6_frame = sll2_frame(ETHERTYPE_IPV6, stream, src_ip='2001:db8::42')
+    packet = packet_payload(PCAP_LINKTYPE_SLL2, ipv6_frame, ports)
+    assert packet and packet[0] == '2001:db8::42', 'IPv6 frame not parsed: %r' % (packet,)
+    print('ok: IPv6 frame parsed -> %s' % packet[0])
+
+    multi = dict(cfg)
+    multi['ports'] = [25565, 25566]
+    assert packet_payload(PCAP_LINKTYPE_SLL2, ipv6_frame, {25565, 25566}), 'multi-port fails'
+    print('ok: port list honoured')
+
+    assert is_ignored([ipaddress.ip_network('192.168.0.0/24')], '192.168.0.5')
+    assert not is_ignored([ipaddress.ip_network('192.168.0.0/24')], '203.0.113.9')
+    print('ok: trust_subnets matching')
+
+    assert nft_set_name('tarpit', '203.0.113.9') == 'tarpit'
+    assert nft_set_name('tarpit', '2001:db8::42') == 'tarpit6'
+    print('ok: nftables set names')
+
+    names = allowed_names(cfg)
     assert 'testbot' not in names, 'whitelist read returned garbage'
-    print('ok: whitelist read (%d names)' % len(names))
+    print('ok: allowed names read (%d)' % len(names))
 
     now = time.time()
     fake = {'10.0.0.1': now + 60, '10.0.0.2': now - 60}
     assert is_trusted(fake, '10.0.0.1', now)
     assert not is_trusted(fake, '10.0.0.2', now)
-    assert not is_trusted(fake, '10.0.0.3', now)
     print('ok: trusted ip logic')
+
+    merged = load_config(config_path=None,
+                         overrides={'ports': '25565,25566', 'ping_policy': 'ignore'})
+    assert merged['ports'] == [25565, 25566]
+    assert merged['ping_policy'] == 'ignore'
+    print('ok: config overrides')
     return 0
 
 
 # --------------------------------------------------------------------------
 # entry point
 # --------------------------------------------------------------------------
-def main(argv=None):
+def build_parser():
     parser = argparse.ArgumentParser(
-        prog='mc_tarpit',
-        description='Drop Minecraft bots that probe your server (nftables side channel).')
-    parser.add_argument('-d', '--server-dir', default=None,
-                        help='directory with whitelist.json/ops.json '
-                             '(env MC_TARPIT_SERVER_DIR, default: cwd)')
-    parser.add_argument('--mode', default=None, choices=('drop', 'log'),
-                        help='drop: real nftables drops, log: dry run '
-                             '(env MC_TARPIT_MODE, default: drop)')
-    parser.add_argument('--port', type=int, default=None,
-                        help='Minecraft port (env MC_TARPIT_PORT, default: 25565)')
+        prog='mc_tarpit.py',
+        description='Drop Minecraft bots that probe your server (nftables side channel).',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='Configuration: defaults < config file < MC_TARPIT_* env < CLI flags.\n'
+               'Config file: mc_tarpit.py --config /etc/mc-tarpit.conf watch')
+    parser.add_argument('--version', action='version', version=VERSION)
+    parser.add_argument('--config', default=None, help='INI config file')
+    parser.add_argument('--server-dir', default=None, help='dir with whitelist.json/ops.json')
+    parser.add_argument('--ports', default=None, help='comma separated ports')
+    parser.add_argument('--mode', default=None, choices=CHOICES['mode'])
+    parser.add_argument('--ping-policy', default=None, choices=CHOICES['ping_policy'])
+    parser.add_argument('--login-policy', default=None, choices=CHOICES['login_policy'])
+    parser.add_argument('--trust-subnets', default=None, help='CIDRs never blocked')
+    parser.add_argument('--trust-ttl', default=None, help='seconds an IP stays trusted')
+    parser.add_argument('--tarpit-ttl', default=None)
+    parser.add_argument('--ping-ttl', default=None)
+    parser.add_argument('--table', default=None, help='nftables table name')
+    parser.add_argument('--iface', default=None, help='capture interface')
+    parser.add_argument('--log-level', default=None, choices=CHOICES['log_level'])
+    parser.add_argument('--log-file', default=None)
+    parser.add_argument('--protocol', default=None, help='protocol for test clients')
+
     sub = parser.add_subparsers(dest='command')
-
     sub.add_parser('watch', help='watch traffic and enforce decisions')
-    sub.add_parser('selftest', help='offline parser self-check')
-    sub.add_parser('status', help='show blocked and trusted IPs')
-    ping = sub.add_parser('ping', help='send a status ping to the server')
-    ping.add_argument('--host', default='127.0.0.1')
-    login = sub.add_parser('login', help='send a login attempt with the given name')
-    login.add_argument('name')
-    login.add_argument('--host', default='127.0.0.1')
+    sub.add_parser('selftest', help='offline self-check')
+    sub.add_parser('status', help='effective config, sets and trusted IPs')
+    replay_cmd = sub.add_parser('replay', help='replay a pcap file, log decisions only')
+    replay_cmd.add_argument('path')
+    ping_cmd = sub.add_parser('ping', help='send a status ping')
+    ping_cmd.add_argument('--host', default='127.0.0.1')
+    login_cmd = sub.add_parser('login', help='send a login attempt with NAME')
+    login_cmd.add_argument('name')
+    login_cmd.add_argument('--host', default='127.0.0.1')
+    trust_cmd = sub.add_parser('trust', help='add IPs to the trusted list')
+    trust_cmd.add_argument('ips', nargs='+')
+    untrust_cmd = sub.add_parser('untrust', help='remove IPs from the trusted list')
+    untrust_cmd.add_argument('ips', nargs='+')
+    return parser
 
+
+def main(argv=None):
+    parser = build_parser()
     args = parser.parse_args(argv)
-    if args.server_dir:
-        CONFIG['server_dir'] = args.server_dir
-    if args.mode:
-        CONFIG['mode'] = args.mode
-    if args.port:
-        CONFIG['port'] = args.port
+
+    overrides = {
+        'server_dir': args.server_dir,
+        'ports': args.ports,
+        'mode': args.mode,
+        'ping_policy': args.ping_policy,
+        'login_policy': args.login_policy,
+        'trust_subnets': args.trust_subnets,
+        'trust_ttl': args.trust_ttl,
+        'tarpit_ttl': args.tarpit_ttl,
+        'ping_ttl': args.ping_ttl,
+        'table': args.table,
+        'iface': args.iface,
+        'log_level': args.log_level,
+        'log_file': args.log_file,
+        'protocol': args.protocol,
+    }
+    cfg = load_config(args.config, overrides)
+    setup_log(cfg)
 
     command = args.command or 'watch'
     if command == 'selftest':
-        return selftest()
+        return selftest(cfg)
     if command == 'status':
-        show_status()
-        return 0
+        return show_status(cfg)
+    if command == 'replay':
+        return replay(cfg, args.path)
     if command == 'ping':
-        send_ping(args.host)
+        send_ping(cfg, args.host)
         return 0
     if command == 'login':
-        send_login(args.name, args.host)
+        send_login(cfg, args.name, args.host)
         return 0
-    return watch()
+    if command in ('trust', 'untrust'):
+        trusted = load_trusted(cfg)
+        now = time.time()
+        for ip in args.ips:
+            try:
+                ipaddress.ip_address(ip)
+            except ValueError:
+                raise SystemExit('not an IP address: %r' % ip)
+            if command == 'trust':
+                trusted[ip] = now + cfg['trust_ttl']
+            else:
+                trusted.pop(ip, None)
+        save_trusted(cfg, trusted)
+        print('%s: %d IPs in %s' % (command, len(trusted), trust_path(cfg)))
+        return 0
+    if command == 'watch':
+        return watch(cfg)
+    parser.error('unknown command: %s' % command)
 
 
 if __name__ == '__main__':

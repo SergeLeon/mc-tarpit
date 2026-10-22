@@ -1,24 +1,29 @@
 [Unit]
 Description=mc-tarpit - drop Minecraft bots that probe the server
-Documentation=https://github.com/
 After=network-online.target nftables.service
 Wants=network-online.target
 
 [Service]
 Type=simple
-# directory with whitelist.json and ops.json
-Environment=MC_TARPIT_SERVER_DIR=/home/mc/server
-Environment=MC_TARPIT_MODE=drop
+# all settings live in the config file (see contrib/mc-tarpit.conf)
+Environment=MC_TARPIT_CONFIG=/etc/mc-tarpit.conf
 # keep journal lines immediate instead of block-buffered
 Environment=PYTHONUNBUFFERED=1
-# trusted IP list lives in $MC_TARPIT_SERVER_DIR/tarpit-trusted.json
 ExecStart=/usr/local/bin/mc_tarpit.py watch
 Restart=always
 RestartSec=5
 StandardOutput=journal
 StandardError=journal
 
-# needs raw packet capture and nftables access
+# needs raw packet capture and nftables access, hence root.
+# To run unprivileged instead, comment the line above and use:
+#   User=mc-tarpit
+#   AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+#   CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+#   NoNewPrivileges=yes
+#   ProtectSystem=full
+#   ProtectHome=read-only
+#   ReadWritePaths=/var/lib/mc-tarpit
 User=root
 
 [Install]

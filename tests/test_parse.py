@@ -1,18 +1,17 @@
-"""Tests for the packet parser and the trusted IP helpers.
+"""Tests for mc-tarpit: parser, config, decisions, trusted IPs.
 
-No frameworks, no network, no nftables: run with
+No frameworks, no network, no nftables:
 
     python3 tests/test_parse.py
-
-or
-
     python3 -m unittest discover -s tests
 """
 import importlib.util
+import ipaddress
+import json
 import os
 import socket
 import struct
-import sys
+import tempfile
 import time
 import unittest
 
@@ -21,6 +20,13 @@ ROOT = os.path.dirname(HERE)
 spec = importlib.util.spec_from_file_location('mc_tarpit', os.path.join(ROOT, 'mc_tarpit.py'))
 mc = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mc)
+
+
+def make_cfg(**overrides):
+    values = dict(mc.DEFAULTS)
+    values.update({'mode': 'log', 'server_dir': tempfile.mkdtemp(), 'log_level': 'warn'})
+    values.update(overrides)
+    return mc.normalize(values)
 
 
 def login_stream(name, protocol=776, host='127.0.0.1', port=25565, next_state=2):
@@ -37,12 +43,20 @@ def login_stream(name, protocol=776, host='127.0.0.1', port=25565, next_state=2)
     return packet
 
 
-def sll2_frame(src_ip, src_port, seq, payload, dst_ip='192.168.0.19', dst_port=25565):
+def frame_ipv4(src_ip, payload, src_port=50000, seq=1000, dst_port=25565):
     ip = b'\x45\x00' + struct.pack('>H', 20 + 20 + len(payload)) + b'\x00\x00\x00\x00'
-    ip += b'\x40\x06\x00\x00' + socket.inet_aton(src_ip) + socket.inet_aton(dst_ip)
-    tcp = struct.pack('>HHII', src_port, dst_port, seq, 0)
-    tcp += b'\x50\x18\xff\xff\x00\x00\x00\x00'
+    ip += b'\x40\x06\x00\x00'
+    ip += socket.inet_aton(src_ip) + socket.inet_aton('192.168.0.19')
+    tcp = struct.pack('>HHII', src_port, dst_port, seq, 0) + b'\x50\x18\xff\xff\x00\x00\x00\x00'
     return struct.pack('>H', 0x0800) + b'\x00' * 18 + ip + tcp + payload
+
+
+def frame_ipv6(src_ip, payload, src_port=50000, seq=1000, dst_port=25565):
+    ip = b'\x60\x00\x00\x00' + struct.pack('>H', 20 + len(payload)) + b'\x06\x40'
+    ip += socket.inet_pton(socket.AF_INET6, src_ip)
+    ip += socket.inet_pton(socket.AF_INET6, '2001:db8::1')
+    tcp = struct.pack('>HHII', src_port, dst_port, seq, 0) + b'\x50\x18\xff\xff\x00\x00\x00\x00'
+    return struct.pack('>H', 0x86DD) + b'\x00' * 18 + ip + tcp + payload
 
 
 class VarIntTests(unittest.TestCase):
@@ -98,35 +112,90 @@ class ParseTests(unittest.TestCase):
 
 
 class FrameTests(unittest.TestCase):
-    def test_sll2_frame(self):
-        frame = sll2_frame('203.0.113.9', 50000, 1000, b'hello')
-        src, sport, seq, flags, payload = mc.packet_payload(mc.PCAP_LINKTYPE_SLL2, frame)
+    def test_ipv4_frame(self):
+        packet = mc.packet_payload(mc.PCAP_LINKTYPE_SLL2,
+                                   frame_ipv4('203.0.113.9', b'hello'), {25565})
+        src, sport, seq, flags, payload = packet
         self.assertEqual(src, '203.0.113.9')
         self.assertEqual(sport, 50000)
-        self.assertEqual(seq, 1000)
+        self.assertEqual(payload, b'hello')
+
+    def test_ipv6_frame(self):
+        packet = mc.packet_payload(mc.PCAP_LINKTYPE_SLL2,
+                                   frame_ipv6('2001:db8::42', b'hello'), {25565})
+        src, sport, seq, flags, payload = packet
+        self.assertEqual(src, '2001:db8::42')
         self.assertEqual(payload, b'hello')
 
     def test_foreign_port_ignored(self):
-        frame = sll2_frame('203.0.113.9', 50000, 1000, b'hello', dst_port=25566)
-        self.assertIsNone(mc.packet_payload(mc.PCAP_LINKTYPE_SLL2, frame))
+        frame = frame_ipv4('203.0.113.9', b'hello', dst_port=25566)
+        self.assertIsNone(mc.packet_payload(mc.PCAP_LINKTYPE_SLL2, frame, {25565}))
+        self.assertIsNotNone(mc.packet_payload(mc.PCAP_LINKTYPE_SLL2, frame, {25565, 25566}))
 
     def test_reassembly_over_pcap(self):
         stream = login_stream('TestBot')
         pcap = b'\xd4\xc3\xb2\xa1' + b'\x02\x00\x04\x00' + b'\x00' * 8
         pcap += b'\xff\xff\x00\x00' + struct.pack('<I', mc.PCAP_LINKTYPE_SLL2)
         for offset in range(0, len(stream), 20):
-            chunk = stream[offset:offset + 20]
-            frame = sll2_frame('203.0.113.9', 50000, 1000 + offset, chunk)
+            frame = frame_ipv4('203.0.113.9', stream[offset:offset + 20], seq=1000 + offset)
             pcap += struct.pack('<IIII', 0, 0, len(frame), len(frame)) + frame
         collected = b''
         name = None
         for linktype, frame in mc.read_pcap_frames(pcap):
-            packet = mc.packet_payload(linktype, frame)
+            packet = mc.packet_payload(linktype, frame, {25565})
             collected += packet[4]
             _, name, _ = mc.parse_client_stream(collected)
             if name:
                 break
         self.assertEqual(name, 'TestBot')
+
+    def test_set_names(self):
+        self.assertEqual(mc.nft_set_name('tarpit', '203.0.113.9'), 'tarpit')
+        self.assertEqual(mc.nft_set_name('tarpit', '2001:db8::42'), 'tarpit6')
+        self.assertEqual(mc.nft_set_name('pingsink', '2001:db8::42'), 'pingsink6')
+
+
+class ConfigTests(unittest.TestCase):
+    def test_ports_csv(self):
+        cfg = make_cfg(ports='25565, 25566 25567')
+        self.assertEqual(cfg['ports'], [25565, 25566, 25567])
+
+    def test_bad_ports(self):
+        with self.assertRaises(SystemExit):
+            make_cfg(ports='abc')
+
+    def test_bad_choice(self):
+        with self.assertRaises(SystemExit):
+            make_cfg(mode='nonsense')
+
+    def test_subnets(self):
+        cfg = make_cfg(trust_subnets='192.168.0.0/24, 10.0.0.0/8')
+        self.assertEqual(len(cfg['subnets']), 2)
+        with self.assertRaises(SystemExit):
+            make_cfg(trust_subnets='not-a-subnet')
+
+    def test_file_then_env_then_cli(self):
+        with tempfile.NamedTemporaryFile('w', suffix='.conf', delete=False) as fh:
+            fh.write('[mc-tarpit]\nports = 25570\nmode = log\nping_policy = ignore\n')
+            path = fh.name
+        try:
+            os.environ.pop('MC_TARPIT_PORTS', None)
+            from_file = mc.load_config(path)
+            self.assertEqual(from_file['ports'], [25570])
+            self.assertEqual(from_file['ping_policy'], 'ignore')
+            os.environ['MC_TARPIT_PORTS'] = '25571'
+            from_env = mc.load_config(path)
+            self.assertEqual(from_env['ports'], [25571])
+            from_env_and_cli = mc.load_config(path, {'ports': '25572'})
+            self.assertEqual(from_env_and_cli['ports'], [25572])
+        finally:
+            os.environ.pop('MC_TARPIT_PORTS', None)
+            os.unlink(path)
+
+    def test_defaults(self):
+        cfg = mc.normalize(dict(mc.DEFAULTS))
+        self.assertEqual(cfg['ports'], [25565])
+        self.assertEqual(cfg['mode'], 'drop')
 
 
 class TrustTests(unittest.TestCase):
@@ -136,6 +205,83 @@ class TrustTests(unittest.TestCase):
         self.assertTrue(mc.is_trusted(data, '1.2.3.4', now))
         self.assertFalse(mc.is_trusted(data, '5.6.7.8', now))
         self.assertFalse(mc.is_trusted(data, '9.9.9.9', now))
+
+    def test_subnet_match(self):
+        subnets = [ipaddress.ip_network('192.168.0.0/24'), ipaddress.ip_network('2001:db8::/32')]
+        self.assertTrue(mc.is_ignored(subnets, '192.168.0.5'))
+        self.assertTrue(mc.is_ignored(subnets, '2001:db8::42'))
+        self.assertFalse(mc.is_ignored(subnets, '203.0.113.9'))
+        self.assertFalse(mc.is_ignored(subnets, 'garbage'))
+
+    def test_save_load(self):
+        cfg = make_cfg()
+        mc.save_trusted(cfg, {'1.2.3.4': time.time() + 60})
+        loaded = mc.load_trusted(cfg)
+        self.assertIn('1.2.3.4', loaded)
+        loaded['5.6.7.8'] = time.time() - 60
+        mc.save_trusted(cfg, loaded)
+        self.assertNotIn('5.6.7.8', mc.load_trusted(cfg))
+
+
+class NamesTests(unittest.TestCase):
+    def test_whitelist_ops_and_extra(self):
+        cfg = make_cfg()
+        with open(os.path.join(cfg['server_dir'], 'whitelist.json'), 'w') as fh:
+            json.dump([{'name': 'SergeLeon'}], fh)
+        with open(os.path.join(cfg['server_dir'], 'ops.json'), 'w') as fh:
+            json.dump([{'name': 'Admin'}], fh)
+        with open(mc.names_path(cfg), 'w') as fh:
+            fh.write('# comment\nFriend\n\n')
+        names = mc.allowed_names(cfg)
+        self.assertEqual(names, {'sergeleon', 'admin', 'friend'})
+
+
+class DecisionTests(unittest.TestCase):
+    def decider(self, **overrides):
+        cfg = make_cfg(**overrides)
+        with open(os.path.join(cfg['server_dir'], 'whitelist.json'), 'w') as fh:
+            json.dump([{'name': 'SergeLeon'}], fh)
+        return cfg, mc.Decider(cfg)
+
+    def test_unknown_login_tarpit(self):
+        _, decider = self.decider()
+        self.assertEqual(decider.decide('203.0.113.9', 2, 'FishNet'), 'tarpit')
+
+    def test_known_login_trusts(self):
+        cfg, decider = self.decider()
+        self.assertEqual(decider.decide('203.0.113.9', 2, 'sergeleon'), 'allow')
+        self.assertIn('203.0.113.9', mc.load_trusted(cfg))
+        self.assertEqual(decider.decide('203.0.113.9', 1, None), 'allow')
+
+    def test_unknown_ping_sink(self):
+        _, decider = self.decider()
+        self.assertEqual(decider.decide('203.0.113.9', 1, None), 'pingsink')
+
+    def test_ping_policy_ignore(self):
+        _, decider = self.decider(ping_policy='ignore')
+        self.assertEqual(decider.decide('203.0.113.9', 1, None), 'ignore')
+
+    def test_login_policy_ignore(self):
+        _, decider = self.decider(login_policy='log')
+        self.assertEqual(decider.decide('203.0.113.9', 2, 'FishNet'), 'ignore')
+
+    def test_subnet_is_ignored(self):
+        _, decider = self.decider(trust_subnets='203.0.113.0/24')
+        self.assertEqual(decider.decide('203.0.113.9', 2, 'FishNet'), 'ignore')
+
+    def test_replay_runs(self):
+        cfg, _ = self.decider()
+        stream = login_stream('TestBot')
+        pcap = b'\xd4\xc3\xb2\xa1' + b'\x02\x00\x04\x00' + b'\x00' * 8
+        pcap += b'\xff\xff\x00\x00' + struct.pack('<I', mc.PCAP_LINKTYPE_SLL2)
+        for offset in (0, 20):
+            chunk = stream[offset:offset + 20]
+            frame = frame_ipv4('203.0.113.9', chunk, seq=1000 + offset)
+            pcap += struct.pack('<IIII', 0, 0, len(frame), len(frame)) + frame
+        path = os.path.join(cfg['server_dir'], 'capture.pcap')
+        with open(path, 'wb') as fh:
+            fh.write(pcap)
+        self.assertEqual(mc.replay(cfg, path), 0)
 
 
 if __name__ == '__main__':
