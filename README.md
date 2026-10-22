@@ -1,20 +1,17 @@
 # mc-tarpit — Minecraft antibot tarpit for server owners
 
-<p align="center">
-  <img alt="Version" src="https://img.shields.io/badge/version-0.2.1-blue">
-  <img alt="License" src="https://img.shields.io/badge/license-MIT-green">
-  <img alt="tests" src="https://github.com/SergeLeon/minecraft-antibot-tarpit/actions/workflows/ci.yml/badge.svg">
-  <img alt="Python" src="https://img.shields.io/badge/python-3.7%2B-3776ab">
-  <img alt="Platform" src="https://img.shields.io/badge/platform-Linux-lightgrey">
-</p>
+[![Version](https://img.shields.io/github/v/release/SergeLeon/minecraft-antibot-tarpit)](https://github.com/SergeLeon/minecraft-antibot-tarpit/releases)
+[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![Tests](https://github.com/SergeLeon/minecraft-antibot-tarpit/actions/workflows/ci.yml/badge.svg)](https://github.com/SergeLeon/minecraft-antibot-tarpit/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/badge/python-3.7%2B-3776ab)](https://www.python.org)
 
-Drops Minecraft bots that scan and probe the server. A passive sniffer watches
+Drops Minecraft bots that scan and probe your server. A passive sniffer watches
 the Minecraft port, parses the handshake and the `Login Start` packet, and puts
 unknown sources into [nftables](https://www.netfilter.org/) sets that silently
-drop their traffic — scanners cannot even tell the server is alive. No mods, no
-server-side plugins, no changes to the live connection path: `tcpdump` hands
-over copies of packets, the kernel enforces the decision, and a broken parse
-blocks nobody.
+drop their traffic — scanners cannot even tell the server is alive.
+
+No mods, no plugins, no proxy. `tcpdump` hands over copies of packets, the
+kernel enforces the decision, and a broken parse blocks nobody.
 
 Bot fleets like `FishNet`, `IcyOwl1855` or `iNHABITors74961` (adjective-animal
 nickname generators) hammer port `25565` around the clock, ping it, then try a
@@ -29,8 +26,7 @@ login with a random nickname. This tool makes that pointless.
   nickname is dropped for 15 minutes, which keeps the server out of bot lists.
 - **Trusted players** — once an IP logs in with a whitelisted name it is trusted
   for 30 days, so its server-list pings keep working.
-- **No mods, no plugins** — works with vanilla, Fabric, Paper, with lazymc or
-  without any proxy.
+- **No mods, no plugins, no proxy** — vanilla, Fabric, Paper, lazymc or plain.
 - **IPv4 and IPv6** — separate `tarpit6`/`pingsink6` sets, IPv6 frames parsed.
 - **Any number of ports** — `ports = 25565,25566,25567` on one host.
 - **Three config sources** — file < `MC_TARPIT_*` environment < CLI flags.
@@ -42,41 +38,26 @@ login with a random nickname. This tool makes that pointless.
 
 ## Installation
 
-Nothing is piped into a root shell: a script that goes straight from `curl` into
-`bash` cannot be inspected or verified. Download it, check the published
-checksum, look at the plan, then run it.
-
 ```bash
-# 1. download the installer and the checksums of the latest release
 curl -fsSLO https://github.com/SergeLeon/minecraft-antibot-tarpit/releases/latest/download/install.sh
-curl -fsSLO https://github.com/SergeLeon/minecraft-antibot-tarpit/releases/latest/download/SHA256SUMS
-sha256sum -c SHA256SUMS --ignore-missing
-
-# 2. see what it is going to touch (nothing is changed)
-sudo bash install.sh --server-dir /home/mc/server --check
-
-# 3. install
 sudo bash install.sh --server-dir /home/mc/server
 ```
 
-The server directory is auto-detected (`~/mcserver`, `/srv/minecraft`,
-`/opt/minecraft`, …) if `--server-dir` is omitted. `install.sh --help` lists
-every flag; `--no-start` installs without starting the service and
-`--uninstall` removes everything.
+The installer writes the tool, the config, the systemd unit and one nftables
+table, starts the service and prints the first log lines. The server directory
+is auto-detected (`~/mcserver`, `/srv/minecraft`, `/opt/minecraft`, …) when
+`--server-dir` is omitted.
 
-### What the installer touches
+Two optional extras, if you prefer to look before you leap:
 
-| Path | Action |
-| --- | --- |
-| `/usr/local/bin/mc_tarpit.py` | the tool (mode 0755) |
-| `/etc/mc-tarpit.conf` | config, previous copy kept as `*.bak-<timestamp>` |
-| `/etc/systemd/system/mc-tarpit.service` | systemd unit |
-| `/etc/nftables.conf` | adds one table, previous copy kept as `*.bak-<timestamp>` |
-| `<server_dir>/tarpit-trusted.json` | trusted IP list (only with `--trust`) |
+```bash
+curl -fsSLO https://github.com/SergeLeon/minecraft-antibot-tarpit/releases/latest/download/SHA256SUMS
+sha256sum -c SHA256SUMS --ignore-missing   # verify the installer
+sudo bash install.sh --check               # print the plan, change nothing
+```
 
-No network access at runtime, no tokens, no keys, no third-party Python
-packages. root is needed only for raw packet capture and nftables; a
-capability-based setup is documented in [DOCUMENTATION.md](DOCUMENTATION.md).
+`install.sh --help` lists every flag; `--no-start` installs without starting the
+service, `--uninstall` removes everything.
 
 ## Quick example
 
@@ -110,7 +91,7 @@ tarpit 45.153.34.119 -> tarpit 1d
 - Linux with nftables (`nft`) and `tcpdump`
 - Python 3.7+, no third-party packages
 - a whitelist on the server (`whitelist.json`, with `ops.json` next to it)
-- root, or `CAP_NET_RAW` + `CAP_NET_ADMIN`
+- root, or `CAP_NET_RAW` + `CAP_NET_ADMIN` (block in `contrib/mc-tarpit.service`)
 
 ## Limitations
 
@@ -126,6 +107,6 @@ tarpit 45.153.34.119 -> tarpit 1d
 - [DOCUMENTATION.md](DOCUMENTATION.md) — every config key, environments, nftables, troubleshooting
 - [CHANGELOG.md](CHANGELOG.md) — Keep a Changelog + SemVer history
 - [SECURITY.md](SECURITY.md) — what runs as root, what the installer touches
-- [Releases](https://github.com/SergeLeon/minecraft-antibot-tarpit/releases) — archives, `SHA256SUMS`
+- [Releases](https://github.com/SergeLeon/minecraft-antibot-tarpit/releases) — archives and `SHA256SUMS`
 - [contrib/](contrib) — nftables table, systemd unit, example config
 - [LICENSE](LICENSE) — MIT

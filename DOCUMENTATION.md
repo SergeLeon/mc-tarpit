@@ -80,15 +80,16 @@ Flags override the config: `--config`, `--server-dir`, `--ports`, `--mode`,
 ## 4. Install and uninstall
 
 ```bash
-# download, verify, dry-check, install
 curl -fsSLO https://github.com/SergeLeon/minecraft-antibot-tarpit/releases/latest/download/install.sh
-curl -fsSLO https://github.com/SergeLeon/minecraft-antibot-tarpit/releases/latest/download/SHA256SUMS
-sha256sum -c SHA256SUMS --ignore-missing
-sudo bash install.sh --server-dir /home/mc/server --check
 sudo bash install.sh --server-dir /home/mc/server
 
 sudo bash install.sh --uninstall      # remove service, config, script, table
 ```
+
+Optional, when you want to inspect before running: `curl -fsSLO
+.../SHA256SUMS && sha256sum -c SHA256SUMS --ignore-missing` verifies the
+installer, `sudo bash install.sh --check` prints the plan and changes nothing,
+and `--sha256 HASH` makes the installer verify the release archive it downloads.
 
 Installer flags:
 
