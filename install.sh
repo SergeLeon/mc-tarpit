@@ -1,9 +1,11 @@
 #!/bin/bash
-# mc-tarpit installer
+# mc-tarpit installer — see SECURITY.md for what this script touches.
 #
-#   sudo ./install.sh [--server-dir DIR] [options]
-#   curl -fsSL https://github.com/SergeLeon/minecraft-antibot-tarpit/releases/latest/download/install.sh \
-#     | sudo bash -s -- [options]
+#   curl -fsSLO https://github.com/SergeLeon/minecraft-antibot-tarpit/releases/latest/download/install.sh
+#   curl -fsSLO https://github.com/SergeLeon/minecraft-antibot-tarpit/releases/latest/download/SHA256SUMS
+#   sha256sum -c SHA256SUMS --ignore-missing
+#   sudo bash install.sh --server-dir /home/mc/server --check
+#   sudo bash install.sh --server-dir /home/mc/server
 #
 # --server-dir DIR   server with whitelist.json (auto-detected when omitted)
 # --ports LIST       comma separated Minecraft ports (default 25565)
@@ -11,6 +13,9 @@
 # --trust-subnets S  CIDRs never blocked, e.g. 192.168.0.0/24
 # --table NAME       nftables table name (default mc_tarpit)
 # --config PATH      config file to write (default /etc/mc-tarpit.conf)
+# --sha256 HASH      expected sha256 of the downloaded release archive
+# --check            print the plan and exit, change nothing
+# --yes              do not ask for confirmation
 # --no-start         install only, do not start the service
 # --uninstall        remove service, config, script and nftables table
 set -euo pipefail
@@ -27,8 +32,11 @@ NFT_CONF=/etc/nftables.conf
 PREFIX=/usr/local/bin
 START=1
 UNINSTALL=0
+CHECK=0
+YES=0
+EXPECTED_SHA=""
 
-usage() { sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
+usage() { sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -38,6 +46,9 @@ while [ $# -gt 0 ]; do
         --trust-subnets) TRUST_SUBNETS=${2:-}; shift 2 ;;
         --table) TABLE=${2:-}; shift 2 ;;
         --config) CONF=${2:-}; shift 2 ;;
+        --sha256) EXPECTED_SHA=${2:-}; shift 2 ;;
+        --check) CHECK=1; shift ;;
+        --yes) YES=1; shift ;;
         --no-start) START=0; shift ;;
         --uninstall) UNINSTALL=1; shift ;;
         -h|--help) usage ;;
@@ -47,17 +58,32 @@ done
 
 [ "$(id -u)" = 0 ] || { echo 'run as root: sudo bash install.sh --server-dir DIR' >&2; exit 1; }
 
-# ---------------------------------------------------------------- sources
-HERE=$(cd "$(dirname "$0")" && pwd)
-if [ ! -f "$HERE/mc_tarpit.py" ] || [ ! -f "$HERE/contrib/nftables.conf" ]; then
-    echo "== fetching sources from $REPO"
-    command -v curl >/dev/null || { echo 'curl is required' >&2; exit 1; }
-    TMP=$(mktemp -d)
-    trap 'rm -rf "$TMP"' EXIT
-    curl -fsSL "$REPO/releases/latest/download/mc-tarpit.tar.gz" \
-        | tar -xzf - -C "$TMP" --strip-components=1
-    HERE=$TMP
-fi
+detect_server_dir() {
+    for dir in "$PWD" /home/*/mcserver /home/*/minecraft /srv/minecraft /srv/mc \
+               /opt/minecraft /opt/mcserver /var/opt/minecraft; do
+        [ -f "$dir/whitelist.json" ] && { printf '%s' "$dir"; return 0; }
+    done
+    return 1
+}
+
+PORT_LIST=$(echo "$PORTS" | tr ',' ' ' | xargs)
+
+print_plan() {
+    cat <<TXT
+plan
+  tool          $PREFIX/mc_tarpit.py           (0755)
+  config        $CONF
+                  server_dir    = $SERVER_DIR
+                  ports         = $PORT_LIST
+                  table         = $TABLE
+                  trust_subnets = ${TRUST_SUBNETS:-<empty>}
+  systemd unit  $UNIT
+  nftables      table inet $TABLE appended to $NFT_CONF (backup kept)
+  trusted IPs   ${TRUST[*]:-<none>} -> $SERVER_DIR/tarpit-trusted.json
+  service       mc-tarpit enabled$( [ "$START" = 1 ] && printf ' and started' )
+  downloads     $REPO/releases/latest/download/mc-tarpit.tar.gz (only if no local sources)
+TXT
+}
 
 # ---------------------------------------------------------------- uninstall
 if [ "$UNINSTALL" = 1 ]; then
@@ -87,17 +113,17 @@ PY
 fi
 
 # ---------------------------------------------------------------- preflight
-for tool in nft tcpdump python3; do
-    command -v "$tool" >/dev/null || { echo "$tool is required" >&2; exit 1; }
+echo '== checking prerequisites'
+missing=0
+for tool in nft tcpdump python3 curl tar; do
+    if command -v "$tool" >/dev/null; then
+        printf '   %-8s %s\n' "$tool" "$(command -v "$tool")"
+    else
+        printf '   %-8s MISSING\n' "$tool"
+        missing=1
+    fi
 done
-
-detect_server_dir() {
-    for dir in "$PWD" /home/*/mcserver /home/*/minecraft /srv/minecraft /srv/mc \
-               /opt/minecraft /opt/mcserver /var/opt/minecraft; do
-        [ -f "$dir/whitelist.json" ] && { printf '%s' "$dir"; return 0; }
-    done
-    return 1
-}
+[ "$missing" = 0 ] || { echo "install the missing tools first (apt install nftables tcpdump python3 curl)" >&2; exit 1; }
 
 if [ -z "$SERVER_DIR" ]; then
     if SERVER_DIR=$(detect_server_dir); then
@@ -109,7 +135,48 @@ if [ -z "$SERVER_DIR" ]; then
 fi
 [ -f "$SERVER_DIR/whitelist.json" ] || echo "warning: $SERVER_DIR/whitelist.json not found" >&2
 
-PORT_LIST=$(echo "$PORTS" | tr ',' ' ' | xargs)
+if [ "$CHECK" = 1 ]; then
+    echo
+    print_plan
+    echo
+    echo 'nothing was changed (--check)'
+    exit 0
+fi
+
+# ---------------------------------------------------------------- sources
+HERE=$(cd "$(dirname "$0")" && pwd)
+if [ ! -f "$HERE/mc_tarpit.py" ] || [ ! -f "$HERE/contrib/nftables.conf" ]; then
+    echo "== downloading $REPO/releases/latest/download/mc-tarpit.tar.gz"
+    TMP=$(mktemp -d)
+    trap 'rm -rf "$TMP"' EXIT
+    curl -fsSL "$REPO/releases/latest/download/mc-tarpit.tar.gz" -o "$TMP/mc-tarpit.tar.gz"
+    ACTUAL_SHA=$(sha256sum "$TMP/mc-tarpit.tar.gz" | awk '{print $1}')
+    echo "   sha256 $ACTUAL_SHA"
+    if [ -n "$EXPECTED_SHA" ]; then
+        if [ "$ACTUAL_SHA" = "$EXPECTED_SHA" ]; then
+            echo '   sha256 matches the expected value'
+        else
+            echo 'sha256 mismatch: the archive is not the one that was published' >&2
+            exit 1
+        fi
+    else
+        echo '   compare this with the release page, or pass --sha256 HASH next time'
+    fi
+    tar -xzf "$TMP/mc-tarpit.tar.gz" -C "$TMP" --strip-components=1
+    HERE=$TMP
+fi
+
+# ---------------------------------------------------------------- confirm
+if [ "$YES" = 0 ] && [ -t 0 ]; then
+    echo
+    print_plan
+    echo
+    read -r -p 'continue? [y/N] ' answer
+    case "$answer" in
+        y|Y|yes|YES) ;;
+        *) echo 'aborted, nothing changed'; exit 1 ;;
+    esac
+fi
 
 # ---------------------------------------------------------------- script
 echo "== script -> $PREFIX/mc_tarpit.py"

@@ -1,181 +1,193 @@
-# mc-tarpit — справочник
+# mc-tarpit — reference
 
-Полная документация: решения, конфиг, режимы, эксплуатация, диагностика.
-Короткий обзор и установка — в [README.md](README.md).
+Decisions, configuration, operation and troubleshooting. Overview and
+installation: [README.md](README.md).
 
-## 1. Как принимается решение
+## 1. How a decision is made
 
 ```
-tcpdump -i any 'tcp dst port 25565'        ← копия пакетов, живой трафик не трогаем
-   ↓ pcap: SLL2 / Ethernet → IPv4/IPv6 → TCP → payload
-новый поток? ─ нет (уже установленное соединение) → игнорируем навсегда
-   │ да (увидели SYN, seq+1 — база)
-   ↓ склейка полезной нагрузки по seq
+tcpdump -i any 'tcp dst port 25565'         <- copies of packets, live traffic untouched
+   | pcap: SLL2 / Ethernet -> IPv4/IPv6 -> TCP -> payload
+new flow? -- no (already established connection) --> ignored forever
+   | yes (SYN seen, seq+1 is the base)
+   | reassemble the client payload by sequence number
 Handshake: id 0x00, protocol, address, port, next_state
-   ├─ next_state ≠ 2 (status-пинг) → политика ping_policy
-   └─ next_state = 2 (login)      → Login Start: id 0x00, len, ник
-                                     политика login_policy
+   |-- next_state != 2 (status ping) --> ping_policy
+   |-- next_state  = 2 (login)       --> Login Start: id 0x00, len, nickname
+                                         login_policy
 ```
 
-| Событие | Условие | Действие |
-|---|---|---|
-| любое | IP входит в `trust_subnets` | всегда пропускаем, ничего не делаем |
-| login | ник в `whitelist.json`, `ops.json` или `names_file` | пропускаем, IP доверен на `trust_ttl` |
-| login | ник неизвестен, `login_policy=tarpit` | IP → `tarpit`/`tarpit6` на `tarpit_ttl` |
-| login | ник неизвестен, `login_policy=log` | только запись в лог |
-| ping | IP не доверен, `ping_policy=sink` | IP → `pingsink`/`pingsink6` на `ping_ttl` |
-| ping | `ping_policy=ignore` | только запись в лог (на уровне `debug`) |
-| мусор | handshake/логин не разобрался | игнорируем (fail-open) |
+| Event | Condition | Action |
+| --- | --- | --- |
+| any | source is inside `trust_subnets` | always allowed, nothing happens |
+| login | nickname in `whitelist.json`, `ops.json` or `names_file` | allowed, IP trusted for `trust_ttl` |
+| login | unknown nickname, `login_policy=tarpit` | IP into `tarpit`/`tarpit6` for `tarpit_ttl` |
+| login | unknown nickname, `login_policy=log` | logged only |
+| ping | IP not trusted, `ping_policy=sink` | IP into `pingsink`/`pingsink6` for `ping_ttl` |
+| ping | `ping_policy=ignore` | logged at `debug` only |
+| garbage | handshake or login failed to parse | ignored (fail-open) |
 
-«Доверен» — IP есть в `trust_file` (JSON `{"<ip>": <unixtime>}`) и срок не вышел.
-Запись добавляется при логине с известным ником, вручную через
-`mc_tarpit.py trust IP` или установщиком (`--trust`).
+"Trusted" means the IP is present in `trust_file` (`{"<ip>": <unixtime>}`) and
+has not expired. Entries are added by any login with a known nickname, by
+`mc_tarpit.py trust IP`, or by the installer (`--trust`).
 
-## 2. Конфигурация
+## 2. Configuration
 
-Приоритет: **значения по умолчанию < конфиг-файл < `MC_TARPIT_*` < флаги CLI**.
-Конфиг-файл — INI, путь задаётся `--config PATH` или `MC_TARPIT_CONFIG`
-(по умолчанию systemd-юнит читает `/etc/mc-tarpit.conf`).
+Precedence: **defaults < config file < `MC_TARPIT_*` environment < CLI flags**.
+The config file is INI, located with `--config PATH` or `MC_TARPIT_CONFIG`
+(the systemd unit reads `/etc/mc-tarpit.conf`).
 
-| Ключ | По умолчанию | Смысл |
-|---|---|---|
-| `server_dir` | `.` | каталог с `whitelist.json` и `ops.json` |
-| `ports` | `25565` | порты через запятую: `25565,25566` |
-| `mode` | `drop` | `drop` — реальные блокировки, `log` — сухой прогон |
-| `ping_policy` | `sink` | `sink` — блокировать недоверенные пинги, `ignore` — не трогать |
-| `login_policy` | `tarpit` | `tarpit` — блокировать чужие логины, `log` — только логировать |
-| `tarpit_ttl` | `1d` | сколько держать блок за чужой логин |
-| `ping_ttl` | `15m` | сколько держать блок за недоверенный пинг |
-| `trust_ttl` | `2592000` | секунд доверия после входа с известным ником |
-| `trust_file` | `tarpit-trusted.json` | список доверенных IP, относительно `server_dir` |
-| `names_file` | `tarpit-names.txt` | дополнительные разрешённые ники, по одному в строке, `#` — комментарий |
-| `trust_subnets` | *(пусто)* | CIDR-ы, которые не блокируются никогда (LAN, прокси) |
-| `table` | `mc_tarpit` | имя nftables-таблицы |
-| `iface` | `any` | интерфейс захвата |
-| `protocol` | `776` | версия протокола для тест-клиентов `ping`/`login` |
-| `log_level` | `info` | `debug` — каждое решение, `info` — действия, `warn` — ошибки |
-| `log_file` | *(stdout)* | писать строки в файл вместо stdout/journal |
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `server_dir` | `.` | directory with `whitelist.json` and `ops.json` |
+| `ports` | `25565` | Minecraft ports, comma separated |
+| `mode` | `drop` | `drop` = real blocks, `log` = dry run |
+| `ping_policy` | `sink` | `sink` = block untrusted pings, `ignore` = leave pings alone |
+| `login_policy` | `tarpit` | `tarpit` = block unknown logins, `log` = log only |
+| `tarpit_ttl` | `1d` | how long an unknown login blocks an IP |
+| `ping_ttl` | `15m` | how long an untrusted ping blocks an IP |
+| `trust_ttl` | `2592000` | seconds an IP stays trusted after a known login |
+| `trust_file` | `tarpit-trusted.json` | trusted IP list, relative to `server_dir` |
+| `names_file` | `tarpit-names.txt` | extra allowed nicknames, one per line, `#` comments |
+| `trust_subnets` | *(empty)* | CIDRs that are never blocked (LAN, proxy) |
+| `table` | `mc_tarpit` | nftables table name |
+| `iface` | `any` | capture interface |
+| `protocol` | `776` | protocol version used by the `ping`/`login` test clients |
+| `log_level` | `info` | `debug` every decision, `info` actions, `warn` errors |
+| `log_file` | *(stdout)* | append log lines to a file instead of stdout/journal |
 
-TTL — в синтаксисе nftables: `30s`, `15m`, `1h`, `1d`, `7d`.
+TTLs use nftables syntax: `30s`, `15m`, `1h`, `1d`, `7d`.
+A fully commented example: [contrib/mc-tarpit.conf](contrib/mc-tarpit.conf).
 
-Пример полного файла: [contrib/mc-tarpit.conf](contrib/mc-tarpit.conf).
-
-## 3. Команды
+## 3. Commands
 
 ```bash
-mc_tarpit.py watch                 # боевой режим (так работает сервис)
-mc_tarpit.py status                # эффективный конфиг, сеты, доверенные IP, ники
-mc_tarpit.py selftest              # оффлайн-самопроверка парсера (11 проверок)
-mc_tarpit.py replay capture.pcap   # решения по сохранённому дампу, без блокировок
-mc_tarpit.py ping  [--host H]      # отправить статус-пинг
-mc_tarpit.py login NAME [--host H] # отправить логин с ником NAME
-mc_tarpit.py trust IP...           # добавить в доверенные
-mc_tarpit.py untrust IP...         # убрать из доверенных
+mc_tarpit.py watch                 # production mode (what the service runs)
+mc_tarpit.py status                # effective config, sets, trusted IPs, names
+mc_tarpit.py selftest              # offline parser self-check (11 checks)
+mc_tarpit.py replay capture.pcap   # decisions for a saved capture, no blocking
+mc_tarpit.py ping  [--host H]      # send a status ping
+mc_tarpit.py login NAME [--host H] # send a login with a fake nickname
+mc_tarpit.py trust IP...           # add IPs to the trusted list
+mc_tarpit.py untrust IP...         # remove them
 ```
 
-Флаги (перебивают конфиг): `--config`, `--server-dir`, `--ports`, `--mode`,
+Flags override the config: `--config`, `--server-dir`, `--ports`, `--mode`,
 `--ping-policy`, `--login-policy`, `--trust-subnets`, `--trust-ttl`,
 `--tarpit-ttl`, `--ping-ttl`, `--table`, `--iface`, `--log-level`,
 `--log-file`, `--protocol`, `--version`.
 
-## 4. Установка и удаление
+## 4. Install and uninstall
 
 ```bash
-curl -fsSL https://github.com/SergeLeon/minecraft-antibot-tarpit/releases/latest/download/install.sh \
-  | sudo bash -s -- [флаги]
+# download, verify, dry-check, install
+curl -fsSLO https://github.com/SergeLeon/minecraft-antibot-tarpit/releases/latest/download/install.sh
+curl -fsSLO https://github.com/SergeLeon/minecraft-antibot-tarpit/releases/latest/download/SHA256SUMS
+sha256sum -c SHA256SUMS --ignore-missing
+sudo bash install.sh --server-dir /home/mc/server --check
+sudo bash install.sh --server-dir /home/mc/server
 
-install.sh --server-dir DIR   # каталог с whitelist.json (иначе автопоиск)
-           --ports LIST       # порты (25565)
-           --trust IP         # доверенный IP, можно повторять
-           --trust-subnets S  # CIDR-ы, которые не блокируются
-           --table NAME       # имя nftables-таблицы
-           --config PATH      # куда писать конфиг (/etc/mc-tarpit.conf)
-           --no-start         # поставить, но не запускать
-           --uninstall        # удалить сервис, конфиг, скрипт и таблицу
-
-sudo ./install.sh --uninstall
+sudo bash install.sh --uninstall      # remove service, config, script, table
 ```
 
-Установщик идемпотентен: повторный запуск обновляет скрипт, конфиг, порты в
-nftables и unit, бэкапит `/etc/nftables.conf` и `/etc/mc-tarpit.conf`.
+Installer flags:
 
-## 5. Разные среды
+| Flag | Meaning |
+| --- | --- |
+| `--server-dir DIR` | server with `whitelist.json` (auto-detected when omitted) |
+| `--ports LIST` | comma separated Minecraft ports (default `25565`) |
+| `--trust IP` | trust an IP right away, repeatable |
+| `--trust-subnets CIDR` | subnets that are never blocked |
+| `--table NAME` | nftables table name (default `mc_tarpit`) |
+| `--config PATH` | where to write the config (default `/etc/mc-tarpit.conf`) |
+| `--check` | print the plan and exit, change nothing |
+| `--no-start` | install but do not start the service |
+| `--sha256 HASH` | expected sha256 of the downloaded release archive |
+| `--yes` | do not ask for confirmation |
+| `--uninstall` | remove everything except the trusted IP list |
 
-**systemd** — штатный вариант: юнит читает `/etc/mc-tarpit.conf`,
-`Restart=always`, логи в journald.
+The installer is idempotent: a second run updates the script, config, ports and
+unit, and keeps timestamped backups of `/etc/nftables.conf` and
+`/etc/mc-tarpit.conf`. When it runs without local sources it downloads
+`mc-tarpit.tar.gz` from the latest release, prints its sha256 and verifies it
+when `--sha256` is given.
 
-**tmux / контейнер / без systemd**:
+## 5. Environments
+
+**systemd** (default): the unit reads `/etc/mc-tarpit.conf`, `Restart=always`,
+logs to the journal.
+
+**tmux / container / no systemd**:
 
 ```bash
 MC_TARPIT_SERVER_DIR=/srv/mc MC_TARPIT_LOG_FILE=/var/log/mc-tarpit.log \
   ./mc_tarpit.py watch
 ```
 
-**Несколько серверов на хосте**: `ports = 25565,25566,25567`; nftables-цепочка
-матчит `set ports`, сеты общие.
+**Several servers on one host**: `ports = 25565,25566,25567`; the nftables chain
+matches `set ports`, the sets are shared.
 
-**IPv6**: настраивать нечего — для IPv6-источников используются `tarpit6` и
-`pingsink6`.
+**IPv6**: nothing to configure, `tarpit6` and `pingsink6` are used for IPv6
+sources automatically.
 
-**За прокси (lazyc/Velocity/BungeeCord)**: если прокси на другом хосте, все
-игроки приходят с его IP — внесите прокси в `trust_subnets` или запускайте
-mc-tarpit на самом прокси. Если прокси локальный (как lazymc на том же хосте),
-снайфер видит настоящие IP клиентов и настраивать ничего не нужно.
+**Behind a proxy (lazyc, Velocity, BungeeCord)**: if the proxy runs on another
+host, all players arrive from the proxy address — put it into `trust_subnets` or
+run mc-tarpit on the proxy itself. A local proxy (lazymc on the same host)
+needs no configuration: the sniffer sees the real client IPs.
 
-**Без root**: создайте пользователя `mc-tarpit`, дайте ему запись в каталог с
-`trust_file`, и в юните используйте закомментированный блок с
-`User=mc-tarpit` + `AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN`.
+**Without root**: create a `mc-tarpit` user, give it write access to the
+directory holding `trust_file`, and use the commented `User=mc-tarpit` +
+`AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN` block in
+`contrib/mc-tarpit.service`.
 
-**Проверка перед боем**: `mode = log` (или `--mode log`) печатает решения и
-ничего не блокирует; `replay` делает то же оффлайн по дампу.
+**Before going live**: `mode = log` (or `--mode log`) prints decisions and
+blocks nothing; `replay` does the same offline for a saved capture.
 
-## 6. Эксплуатация и диагностика
+## 6. Operation and troubleshooting
 
 ```bash
-sudo journalctl -u mc-tarpit -f                      # живой поток решений
-sudo mc_tarpit.py status                             # конфиг + сеты + доверенные
-sudo nft list set inet mc_tarpit tarpit              # кто заблокирован
-sudo nft list set inet mc_tarpit pingsink6           # блокировки IPv6 за пинги
-sudo nft -a list table inet mc_tarpit | grep counter # сколько пакетов отсёк
-sudo nft delete element inet mc_tarpit tarpit { 1.2.3.4 }   # простить сейчас
+sudo journalctl -u mc-tarpit -f                      # live decisions
+sudo mc_tarpit.py status                             # config + sets + trusted
+sudo nft list set inet mc_tarpit tarpit              # who is blocked
+sudo nft list set inet mc_tarpit pingsink6            # IPv6 ping blocks
+sudo nft -a list table inet mc_tarpit | grep counter  # packets dropped
+sudo nft delete element inet mc_tarpit tarpit { 1.2.3.4 }   # forgive now
 sudo nft delete element inet mc_tarpit pingsink { 1.2.3.4 }
 ```
 
-Типичные строки журнала:
+Log lines and what they mean:
 
-| Строка | Что значит |
-|---|---|
-| `watching ports=… mode=… trusted=N` | сервис поднялся, сколько доверенных IP загружено |
-| `login IP name='X' ok` | вход известного игрока, IP попадает в доверенные |
-| `login IP name='X' not-whitelisted` | чужой ник |
-| `tarpit IP -> tarpit 1d` | блок за чужой логин |
-| `ping IP -> pingsink 15m (not trusted)` | блок за пинг с недоверенного IP |
-| `ignore IP (trust_subnets)` | IP из доверенной подсети, ничего не делаем |
-| `nft tarpit failed for IP: …` | нет прав/таблицы — проверьте `nft list ruleset` |
+| Line | Meaning |
+| --- | --- |
+| `watching ports=... mode=... trusted=N` | service started, number of trusted IPs loaded |
+| `login IP name='X' ok` | known player, IP becomes trusted |
+| `login IP name='X' not-whitelisted` | unknown nickname |
+| `tarpit IP -> tarpit 1d` | blocked for an unknown login |
+| `ping IP -> pingsink 15m (not trusted)` | blocked for a ping from an untrusted IP |
+| `ignore IP (trust_subnets)` | IP is inside a trusted subnet |
+| `nft tarpit failed for IP: ...` | no permission or no table — check `nft list ruleset` |
 
-Содержимое сетов не сохраняется при перезагрузке (правила и `trust_file` —
-сохраняются). Если игрок сменил IP, в списке серверов он будет «недоступен» до
-первого входа — сам вход проверяется по нику и работает.
+Set contents are lost on reboot (rules and the trusted file survive). A player
+whose IP changed shows as offline in the multiplayer list until the next
+successful login; the login itself is checked by nickname and always works.
 
-## 7. Протокол и ограничения парсера
+## 7. Protocol and parser limits
 
-- Читаются два пакета: handshake (`next_state`) и `Login Start` (первые 1–16
-  байт ника). Остальное не нужно, поэтому версия протокола почти не важна.
-- Парсится только поток клиент→сервер; серверные ответы не читаются.
-- Соединение разбирается, только начиная с его SYN: иначе пакеты из середины
-  установленной сессии могли бы быть приняты за handshake (реальный случай —
-  ложная блокировка игрока в первой версии).
-- IPv6: заголовки расширения не разбираются, такие пакеты игнорируются
-  (fail-open, ложных блокировок нет).
-- TCP-пересклейка ограничена: пакеты с дырой в последовательности сбрасывают
-  разбор потока, буфер до 4 КБ, поток живёт 60 секунд.
+- Only two packets are read: the handshake (`next_state`) and `Login Start`
+  (first 1–16 bytes of the nickname), so the protocol version is almost
+  irrelevant.
+- Only the client-to-server stream is parsed; server responses are not read.
+- A connection is parsed only after its SYN was seen. Otherwise packets from the
+  middle of an established session could be mistaken for a handshake (this
+  happened in the first build and blocked a real player).
+- IPv6 extension headers are not followed; such packets are ignored
+  (fail-open, no false blocks).
+- Reassembly is bounded: a sequence gap aborts the flow, buffer up to 4 KB,
+  a flow expires after 60 seconds.
 
-## 8. Безопасность
+## 8. Security
 
-- Тарпит **не заменяет** аутентификацию: при `online-mode=false` ник можно
-  подделать, и утилита этого не поймает (она фильтрует сканеров, а не людей).
-- Установщик требует root; боевой процесс — тоже (raw-сокеты + nftables).
-  Вариант с capabilities описан в `contrib/mc-tarpit.service`.
-- Токены и ключи утилите не нужны вообще: она работает только с локальными
-  файлами, пакетами и nftables.
-- Все блокировки — по IP и с TTL, «вечных» банов утилита не ставит.
+See [SECURITY.md](SECURITY.md) for what runs as root, what the installer
+touches and how to report a problem. Short version: the tool needs no tokens,
+no network access at runtime and no third-party packages; it only reads local
+files and packets and adds members to two nftables sets.
