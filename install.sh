@@ -2,10 +2,12 @@
 # mc-tarpit installer — see SECURITY.md for what this script touches.
 #
 #   curl -fsSLO https://github.com/SergeLeon/minecraft-antibot-tarpit/releases/latest/download/install.sh
-#   curl -fsSLO https://github.com/SergeLeon/minecraft-antibot-tarpit/releases/latest/download/SHA256SUMS
-#   sha256sum -c SHA256SUMS --ignore-missing
-#   sudo bash install.sh --server-dir /home/mc/server --check
 #   sudo bash install.sh --server-dir /home/mc/server
+#
+# Optional: verify the download against the SHA256SUMS asset, preview the
+# changes with --check, skip the confirmation prompt with --yes, install
+# without starting the service with --no-start, remove everything with
+# --uninstall.
 #
 # --server-dir DIR   server with whitelist.json (auto-detected when omitted)
 # --ports LIST       comma separated Minecraft ports (default 25565)
@@ -36,7 +38,7 @@ CHECK=0
 YES=0
 EXPECTED_SHA=""
 
-usage() { sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
+usage() { sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
 
 while [ $# -gt 0 ]; do
     case "$1" in
