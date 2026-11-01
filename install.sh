@@ -13,6 +13,8 @@
 # --ports LIST       comma separated Minecraft ports (default 25565)
 # --trust IP         IP to trust right away, repeatable (your player, LAN)
 # --trust-subnets S  CIDRs never blocked, e.g. 192.168.0.0/24
+# --tarpit-ttl T     how long an unknown login stays blocked (default 1d)
+# --ping-ttl T       how long an untrusted ping stays blocked (default 1m)
 # --table NAME       nftables table name (default mc_tarpit)
 # --config PATH      config file to write (default /etc/mc-tarpit.conf)
 # --sha256 HASH      expected sha256 of the downloaded release archive
@@ -27,6 +29,8 @@ SERVER_DIR=""
 PORTS="25565"
 TRUST=()
 TRUST_SUBNETS=""
+TARPIT_TTL="1d"
+PING_TTL="1m"
 TABLE="mc_tarpit"
 CONF=/etc/mc-tarpit.conf
 UNIT=/etc/systemd/system/mc-tarpit.service
@@ -46,6 +50,8 @@ while [ $# -gt 0 ]; do
         --ports) PORTS=${2:-}; shift 2 ;;
         --trust) TRUST+=("${2:-}"); shift 2 ;;
         --trust-subnets) TRUST_SUBNETS=${2:-}; shift 2 ;;
+        --tarpit-ttl) TARPIT_TTL=${2:-}; shift 2 ;;
+        --ping-ttl) PING_TTL=${2:-}; shift 2 ;;
         --table) TABLE=${2:-}; shift 2 ;;
         --config) CONF=${2:-}; shift 2 ;;
         --sha256) EXPECTED_SHA=${2:-}; shift 2 ;;
@@ -79,6 +85,8 @@ plan
                   ports         = $PORT_LIST
                   table         = $TABLE
                   trust_subnets = ${TRUST_SUBNETS:-<empty>}
+                  tarpit_ttl    = $TARPIT_TTL
+                  ping_ttl      = $PING_TTL
   systemd unit  $UNIT
   nftables      table inet $TABLE appended to $NFT_CONF (backup kept)
   trusted IPs   ${TRUST[*]:-<none>} -> $SERVER_DIR/tarpit-trusted.json
@@ -191,6 +199,8 @@ sed -e "s|^server_dir = .*|server_dir = $SERVER_DIR|" \
     -e "s|^ports = .*|ports = $PORT_LIST|" \
     -e "s|^table = .*|table = $TABLE|" \
     -e "s|^trust_subnets = .*|trust_subnets = $TRUST_SUBNETS|" \
+    -e "s|^tarpit_ttl = .*|tarpit_ttl = $TARPIT_TTL|" \
+    -e "s|^ping_ttl = .*|ping_ttl = $PING_TTL|" \
     "$HERE/contrib/mc-tarpit.conf" > "$CONF"
 chmod 0644 "$CONF"
 
