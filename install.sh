@@ -22,6 +22,9 @@
 # --yes              do not ask for confirmation
 # --no-start         install only, do not start the service
 # --uninstall        remove service, config, script and nftables table
+#
+# A second run keeps an existing config and only rewrites the keys that were
+# passed on the command line, so hand-tuned values survive a reinstall.
 set -euo pipefail
 
 REPO=${MC_TARPIT_REPO:-https://github.com/SergeLeon/minecraft-antibot-tarpit}
@@ -85,7 +88,7 @@ print_plan() {
     cat <<TXT
 plan
   tool          $PREFIX/mc_tarpit.py           (0755)
-  config        $CONF
+  config        $CONF$( [ -f "$CONF" ] && printf ' (kept, only the keys given on this run are updated)' )
                   server_dir    = $SERVER_DIR
                   ports         = $PORT_LIST
                   table         = $TABLE
