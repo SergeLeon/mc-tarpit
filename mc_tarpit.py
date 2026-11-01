@@ -139,8 +139,12 @@ def log(message, level='info'):
 # configuration
 # --------------------------------------------------------------------------
 def read_config_file(path):
-    """Read an INI file, any section name, only known keys are used."""
-    parser = configparser.ConfigParser()
+    """Read an INI file, any section name, only known keys are used.
+
+    Interpolation is off: a value may legitimately contain a percent sign
+    (a log path, an unescaped comment) and must not be read as a placeholder.
+    """
+    parser = configparser.ConfigParser(interpolation=None)
     if not parser.read(path):
         raise SystemExit('config file not readable: %s' % path)
     values = {}

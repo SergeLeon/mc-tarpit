@@ -304,6 +304,16 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(cfg['ports'], [25565])
         self.assertEqual(cfg['mode'], 'drop')
 
+    def test_percent_signs_are_not_interpolated(self):
+        with tempfile.NamedTemporaryFile('w', suffix='.conf', delete=False) as fh:
+            fh.write('[mc-tarpit]\nlog_file = /var/log/mc-100%-tarpit.log\n')
+            path = fh.name
+        try:
+            cfg = mc.load_config(path)
+        finally:
+            os.unlink(path)
+        self.assertEqual(cfg['log_file'], '/var/log/mc-100%-tarpit.log')
+
 
 class TrustTests(unittest.TestCase):
     def test_expiry(self):
