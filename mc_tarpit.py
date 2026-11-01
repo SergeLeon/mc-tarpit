@@ -95,6 +95,8 @@ CHOICES = {
 
 LOG_LEVELS = {'debug': 0, 'info': 1, 'warn': 2}
 
+TTL_UNITS = {'s': 1, 'm': 60, 'h': 3600, 'd': 86400, 'w': 604800}
+
 PROTO_LOGIN = 2
 
 PCAP_LINKTYPE_EN10MB = 1
@@ -174,6 +176,18 @@ def load_config(config_path=None, overrides=None):
     return normalize(cfg)
 
 
+def ttl_seconds(ttl):
+    """'15m' -> 900, a bare number is taken as seconds, junk gives 0."""
+    text = str(ttl).strip().lower()
+    if not text:
+        return 0
+    unit = TTL_UNITS.get(text[-1:])
+    try:
+        return int(text[:-1]) * unit if unit else int(text)
+    except ValueError:
+        return 0
+
+
 def normalize(cfg):
     ports = str(cfg['ports']).replace(',', ' ').split()
     try:
@@ -187,6 +201,10 @@ def normalize(cfg):
             cfg[key] = int(cfg[key])
         except ValueError:
             raise SystemExit('%s must be an integer: %r' % (key, cfg[key]))
+    for key in ('tarpit_ttl', 'ping_ttl'):
+        if ttl_seconds(cfg[key]) <= 0:
+            raise SystemExit('%s must be a number with one unit, e.g. 30s, '
+                             '15m, 1h, 1d: %r' % (key, cfg[key]))
     for key, allowed in CHOICES.items():
         if cfg[key] not in allowed:
             raise SystemExit('%s must be one of %s, got %r'
@@ -571,7 +589,6 @@ def is_ignored(subnets, ip):
 # --------------------------------------------------------------------------
 # nftables
 # --------------------------------------------------------------------------
-TTL_UNITS = {'s': 1, 'm': 60, 'h': 3600, 'd': 86400, 'w': 604800}
 BLOCK_CACHE_MAX = 65536
 
 
@@ -586,18 +603,6 @@ def subprocess_run(cmd):
     except OSError as error:
         log('%s failed: %s' % (cmd[0], error), 'warn')
         return None
-
-
-def ttl_seconds(ttl):
-    """'15m' -> 900, a bare number is taken as seconds, junk gives 0."""
-    text = str(ttl).strip().lower()
-    if not text:
-        return 0
-    unit = TTL_UNITS.get(text[-1:])
-    try:
-        return int(text[:-1]) * unit if unit else int(text)
-    except ValueError:
-        return 0
 
 
 def nft_add(cfg, kind, ip, ttl):

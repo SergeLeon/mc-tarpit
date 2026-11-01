@@ -275,6 +275,12 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             make_cfg(mode='nonsense')
 
+    def test_bad_ttl(self):
+        for ttl in ('1 day', '', 'forever', '1y'):
+            with self.assertRaises(SystemExit):
+                make_cfg(tarpit_ttl=ttl)
+        self.assertEqual(make_cfg(tarpit_ttl='90m')['tarpit_ttl'], '90m')
+
     def test_subnets(self):
         cfg = make_cfg(trust_subnets='192.168.0.0/24, 10.0.0.0/8')
         self.assertEqual(len(cfg['subnets']), 2)
