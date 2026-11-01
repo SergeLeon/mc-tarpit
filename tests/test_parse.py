@@ -350,6 +350,43 @@ class DecisionTests(unittest.TestCase):
             json.dump([{'name': 'SergeLeon'}], fh)
         return cfg, mc.Decider(cfg)
 
+    def test_ttl_seconds(self):
+        self.assertEqual(mc.ttl_seconds('15m'), 900)
+        self.assertEqual(mc.ttl_seconds('30s'), 30)
+        self.assertEqual(mc.ttl_seconds('2h'), 7200)
+        self.assertEqual(mc.ttl_seconds('1d'), 86400)
+        self.assertEqual(mc.ttl_seconds('45'), 45)
+        self.assertEqual(mc.ttl_seconds('junk'), 0)
+
+    def test_one_nft_call_per_ttl_window(self):
+        cfg = make_cfg(mode='drop')
+        with open(os.path.join(cfg['server_dir'], 'whitelist.json'), 'w') as fh:
+            json.dump([{'name': 'SergeLeon'}], fh)
+        calls = []
+        real = mc.nft_add
+        mc.nft_add = lambda *args: calls.append(args) or True
+        try:
+            decider = mc.Decider(cfg)
+            for _ in range(5):
+                self.assertEqual(decider.decide('203.0.113.9', 2, 'FishNet'), 'tarpit')
+        finally:
+            mc.nft_add = real
+        self.assertEqual(len(calls), 1)
+
+    def test_a_new_ping_window_reaches_nft_again(self):
+        cfg = make_cfg(mode='drop')
+        calls = []
+        real = mc.nft_add
+        mc.nft_add = lambda *args: calls.append(args) or True
+        try:
+            decider = mc.Decider(cfg)
+            now = time.time()
+            decider.blocked[('pingsink', '203.0.113.9')] = now - 1
+            decider.decide('203.0.113.9', 1, None)
+        finally:
+            mc.nft_add = real
+        self.assertEqual(len(calls), 1)
+
     def test_unknown_login_tarpit(self):
         _, decider = self.decider()
         self.assertEqual(decider.decide('203.0.113.9', 2, 'FishNet'), 'tarpit')

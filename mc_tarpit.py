@@ -556,8 +556,24 @@ def is_ignored(subnets, ip):
 # --------------------------------------------------------------------------
 # nftables
 # --------------------------------------------------------------------------
+TTL_UNITS = {'s': 1, 'm': 60, 'h': 3600, 'd': 86400, 'w': 604800}
+BLOCK_CACHE_MAX = 65536
+
+
 def nft_set_name(kind, ip):
     return kind + ('6' if ':' in ip else '')
+
+
+def ttl_seconds(ttl):
+    """'15m' -> 900, a bare number is taken as seconds, junk gives 0."""
+    text = str(ttl).strip().lower()
+    if not text:
+        return 0
+    unit = TTL_UNITS.get(text[-1:])
+    try:
+        return int(text[:-1]) * unit if unit else int(text)
+    except ValueError:
+        return 0
 
 
 def nft_add(cfg, kind, ip, ttl):
@@ -573,14 +589,28 @@ def nft_add(cfg, kind, ip, ttl):
     return True
 
 
-def tarpit(cfg, ip, ttl):
-    log('tarpit %s -> %s %s' % (ip, nft_set_name('tarpit', ip), ttl))
-    nft_add(cfg, 'tarpit', ip, ttl)
+def enforce(cfg, kind, ip, ttl, blocked, now):
+    """Add the address to its set once per TTL window.
 
-
-def ping_sink(cfg, ip):
-    log('ping %s -> %s %s (not trusted)' % (ip, nft_set_name('pingsink', ip), cfg['ping_ttl']))
-    nft_add(cfg, 'pingsink', ip, cfg['ping_ttl'])
+    nftables refuses an element it already has ("File exists"), so a bot that
+    keeps knocking would fork nft and log a warning on every packet. Remember
+    what was added recently instead.
+    """
+    key = (nft_set_name(kind, ip), ip)
+    expiry = blocked.get(key)
+    if expiry is not None and expiry > now:
+        return False
+    if len(blocked) > BLOCK_CACHE_MAX:
+        for stale in [k for k, v in blocked.items() if v <= now]:
+            del blocked[stale]
+    blocked[key] = now + (ttl_seconds(ttl) or 60)
+    set_name = nft_set_name(kind, ip)
+    if kind == 'tarpit':
+        log('tarpit %s -> %s %s' % (ip, set_name, ttl))
+    else:
+        log('ping %s -> %s %s (not trusted)' % (ip, set_name, ttl))
+    nft_add(cfg, kind, ip, ttl)
+    return True
 
 
 # --------------------------------------------------------------------------
@@ -595,6 +625,7 @@ class Decider:
         self.names_at = time.time()
         self.trusted = load_trusted(cfg)
         self.trusted_at = time.time()
+        self.blocked = {}
 
     def refresh(self, now):
         if now - self.names_at > 30:
@@ -620,7 +651,7 @@ class Decider:
             if is_trusted(self.trusted, ip):
                 log('ping %s (trusted)' % ip, 'debug')
                 return 'allow'
-            ping_sink(cfg, ip)
+            enforce(cfg, 'pingsink', ip, cfg['ping_ttl'], self.blocked, now)
             return 'pingsink'
 
         known = name.lower() in self.names
@@ -635,7 +666,7 @@ class Decider:
         if cfg['login_policy'] == 'log':
             log('login %s ignored (login_policy=log)' % ip)
             return 'ignore'
-        tarpit(cfg, ip, cfg['tarpit_ttl'])
+        enforce(cfg, 'tarpit', ip, cfg['tarpit_ttl'], self.blocked, now)
         return 'tarpit'
 
 
