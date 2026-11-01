@@ -6,13 +6,18 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        # 3.7 is still the documented floor, but setup-python no longer ships
-        # it for current runners; 3.9 is the oldest that is available.
-        python-version: ['3.9', '3.12']
+        # 3.7 is still the documented floor, but setup-python no longer builds
+        # it for any current runner. 3.9 is the oldest that still installs, and
+        # only on ubuntu-22.04, hence the per-entry runner.
+        include:
+          - python-version: '3.9'
+            os: ubuntu-22.04
+          - python-version: '3.12'
+            os: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     name: python ${{ matrix.python-version }}
     steps:
       - uses: actions/checkout@v4
