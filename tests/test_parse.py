@@ -246,6 +246,21 @@ class FlowTests(unittest.TestCase):
                              for frame in self.frames(login_stream('', next_state=1))) if d]
         self.assertEqual(found, [('203.0.113.9', 1, None)])
 
+    def test_syn_flood_is_bounded(self):
+        tracker = mc.FlowTracker({25565}, max_slots=4)
+        for port in range(100):
+            frame = frame_ipv4('203.0.113.9', b'', src_port=40000 + port, flags=mc.SYN_FLAG)
+            self.assertIsNone(self.feed(tracker, frame))
+        self.assertLessEqual(len(tracker.flows), 4)
+
+    def test_expired_flows_are_forgotten_under_pressure(self):
+        tracker = mc.FlowTracker({25565}, max_slots=1)
+        syn = frame_ipv4('203.0.113.9', b'', flags=mc.SYN_FLAG)
+        other = frame_ipv4('198.51.100.7', b'', flags=mc.SYN_FLAG)
+        tracker.feed(mc.PCAP_LINKTYPE_SLL2, syn, now=1000.0)
+        tracker.feed(mc.PCAP_LINKTYPE_SLL2, other, now=1000.0 + mc.FLOW_TIMEOUT + 1)
+        self.assertEqual(list(tracker.flows), [('198.51.100.7', 50000)])
+
 
 class ConfigTests(unittest.TestCase):
     def test_ports_csv(self):

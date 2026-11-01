@@ -404,6 +404,7 @@ def read_pcap_frames(stream):
 # --------------------------------------------------------------------------
 FLOW_TIMEOUT = 60
 FLOW_MAX_BYTES = 4096
+FLOW_MAX_SLOTS = 8192
 
 
 class FlowTracker:
@@ -414,10 +415,13 @@ class FlowTracker:
     parser and would block real players.
     """
 
-    def __init__(self, ports, timeout=FLOW_TIMEOUT, max_bytes=FLOW_MAX_BYTES):
+    def __init__(self, ports, timeout=FLOW_TIMEOUT, max_bytes=FLOW_MAX_BYTES,
+                 max_slots=FLOW_MAX_SLOTS):
         self.ports = ports
         self.timeout = timeout
         self.max_bytes = max_bytes
+        self.max_slots = max_slots
+        self.swept = 0.0
         self.flows = {}
 
     def feed(self, linktype, frame, now=None):
@@ -430,8 +434,7 @@ class FlowTracker:
         key = (src, src_port)
 
         if flags & SYN_FLAG:
-            self.flows[key] = {'buf': bytearray(), 'seq': seq + 1,
-                               'at': now, 'done': False}
+            self.open(key, seq + 1, now)
             return None
 
         flow = self.flows.get(key)
@@ -459,6 +462,27 @@ class FlowTracker:
         if raw:
             log('raw %s name=%r %s' % (src, name, raw.hex()), 'debug')
         return src, state, name
+
+    def open(self, key, seq, now):
+        """Track a new flow, keeping the table inside max_slots."""
+        if len(self.flows) >= self.max_slots:
+            self.sweep(now)
+        while len(self.flows) >= self.max_slots:
+            self.flows.pop(next(iter(self.flows)))   # oldest flow first
+        self.flows[key] = {'buf': bytearray(), 'seq': seq, 'at': now, 'done': False}
+
+    def sweep(self, now):
+        """Forget expired flows at most once a second.
+
+        Without a cap a SYN flood from many sources grows the table without
+        limit; the FIFO eviction in open() keeps memory flat, this keeps it
+        from evicting flows that still matter.
+        """
+        if now - self.swept < 1.0:
+            return
+        self.swept = now
+        for key in [k for k, v in self.flows.items() if now - v['at'] > self.timeout]:
+            del self.flows[key]
 
 
 # --------------------------------------------------------------------------
