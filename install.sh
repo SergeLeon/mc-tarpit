@@ -41,6 +41,7 @@ UNINSTALL=0
 CHECK=0
 YES=0
 EXPECTED_SHA=""
+declare -A GIVEN=()
 
 usage() {
     awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
@@ -49,13 +50,13 @@ usage() {
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --server-dir) SERVER_DIR=${2:-}; shift 2 ;;
-        --ports) PORTS=${2:-}; shift 2 ;;
+        --server-dir) SERVER_DIR=${2:-}; GIVEN[server_dir]=1; shift 2 ;;
+        --ports) PORTS=${2:-}; GIVEN[ports]=1; shift 2 ;;
         --trust) TRUST+=("${2:-}"); shift 2 ;;
-        --trust-subnets) TRUST_SUBNETS=${2:-}; shift 2 ;;
-        --tarpit-ttl) TARPIT_TTL=${2:-}; shift 2 ;;
-        --ping-ttl) PING_TTL=${2:-}; shift 2 ;;
-        --table) TABLE=${2:-}; shift 2 ;;
+        --trust-subnets) TRUST_SUBNETS=${2:-}; GIVEN[trust_subnets]=1; shift 2 ;;
+        --tarpit-ttl) TARPIT_TTL=${2:-}; GIVEN[tarpit_ttl]=1; shift 2 ;;
+        --ping-ttl) PING_TTL=${2:-}; GIVEN[ping_ttl]=1; shift 2 ;;
+        --table) TABLE=${2:-}; GIVEN[table]=1; shift 2 ;;
         --config) CONF=${2:-}; shift 2 ;;
         --sha256) EXPECTED_SHA=${2:-}; shift 2 ;;
         --check) CHECK=1; shift ;;
@@ -196,15 +197,61 @@ echo "== script -> $PREFIX/mc_tarpit.py"
 install -m 0755 "$HERE/mc_tarpit.py" "$PREFIX/mc_tarpit.py"
 
 # ---------------------------------------------------------------- config
+# config_set rewrites one key of the INI file and appends it when missing.
+# Python instead of sed: paths and CIDRs may contain characters sed would
+# interpret, and the key is matched exactly once.
+config_set() {
+    python3 - "$CONF" "$1" "$2" <<'PY'
+import re
+import sys
+
+path, key, value = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    with open(path, encoding='utf-8') as fh:
+        lines = fh.readlines()
+except OSError:
+    lines = []
+pattern = re.compile(r'^\s*%s\s*=' % re.escape(key))
+out = []
+written = False
+for line in lines:
+    if pattern.match(line):
+        if not written:
+            out.append('%s = %s\n' % (key, value))
+            written = True
+        continue
+    out.append(line)
+if not written:
+    out.append('%s = %s\n' % (key, value))
+with open(path, 'w', encoding='utf-8') as fh:
+    fh.writelines(out)
+PY
+}
+
+declare -A VALUE=(
+    [server_dir]="$SERVER_DIR"
+    [ports]="$PORT_LIST"
+    [table]="$TABLE"
+    [trust_subnets]="$TRUST_SUBNETS"
+    [tarpit_ttl]="$TARPIT_TTL"
+    [ping_ttl]="$PING_TTL"
+)
+
 echo "== config -> $CONF"
-[ -f "$CONF" ] && cp -a "$CONF" "$CONF.bak-$(date +%Y%m%d-%H%M%S)"
-sed -e "s|^server_dir = .*|server_dir = $SERVER_DIR|" \
-    -e "s|^ports = .*|ports = $PORT_LIST|" \
-    -e "s|^table = .*|table = $TABLE|" \
-    -e "s|^trust_subnets = .*|trust_subnets = $TRUST_SUBNETS|" \
-    -e "s|^tarpit_ttl = .*|tarpit_ttl = $TARPIT_TTL|" \
-    -e "s|^ping_ttl = .*|ping_ttl = $PING_TTL|" \
-    "$HERE/contrib/mc-tarpit.conf" > "$CONF"
+if [ -f "$CONF" ]; then
+    cp -a "$CONF" "$CONF.bak-$(date +%Y%m%d-%H%M%S)"
+    echo '   existing config kept (backup written), only the keys given on this run change'
+    for key in "${!VALUE[@]}"; do
+        if [ -n "${GIVEN[$key]:-}" ]; then
+            config_set "$key" "${VALUE[$key]}"
+        fi
+    done
+else
+    install -m 0644 "$HERE/contrib/mc-tarpit.conf" "$CONF"
+    for key in "${!VALUE[@]}"; do
+        config_set "$key" "${VALUE[$key]}"
+    done
+fi
 chmod 0644 "$CONF"
 
 # ---------------------------------------------------------------- nftables
@@ -215,12 +262,12 @@ import re
 import sys
 
 path, ports, table = sys.argv[1], sys.argv[2], sys.argv[3]
-text = open(path).read()
+text = open(path, encoding='utf-8').read()
 pattern = r'(table inet %s \{.*?set ports \{.*?elements = \{)[^}]*(\})' % re.escape(table)
 new, count = re.subn(pattern, lambda m: m.group(1) + ' ' + ports + ' ' + m.group(2),
                      text, count=1, flags=re.S)
 if count:
-    open(path, 'w').write(new)
+    open(path, 'w', encoding='utf-8').write(new)
     print('ports updated to', ports)
 else:
     print('warning: table has no `set ports`, edit %s manually' % path)
@@ -234,8 +281,31 @@ else
     echo "table appended to $NFT_CONF"
 fi
 systemctl enable nftables >/dev/null 2>&1 || true
-systemctl restart nftables 2>/dev/null || nft -f "$NFT_CONF"
-nft list set inet "$TABLE" tarpit >/dev/null && echo 'sets are ready'
+if nft list table inet "$TABLE" >/dev/null 2>&1; then
+    # A full reload of /etc/nftables.conf would wipe the contents of the
+    # tarpit/pingsink sets, which exist only in the kernel, so touch the port
+    # set of the running table instead.
+    if nft flush set inet "$TABLE" ports \
+       && nft add element inet "$TABLE" ports "{ $PORT_LIST }"; then
+        echo "live port set updated to $PORT_LIST, blocked addresses kept"
+    else
+        echo 'warning: could not update the live port set, run: nft list ruleset' >&2
+    fi
+else
+    SNIPPET=$(mktemp)
+    sed "s|elements = { 25565 }|elements = { $PORT_LIST }|" "$HERE/contrib/nftables.conf" > "$SNIPPET"
+    if nft -f "$SNIPPET"; then
+        echo "table inet $TABLE loaded"
+    else
+        echo 'warning: nft -f failed, check /etc/nftables.conf' >&2
+    fi
+    rm -f "$SNIPPET"
+fi
+if nft list set inet "$TABLE" tarpit >/dev/null 2>&1; then
+    echo 'sets are ready'
+else
+    echo 'warning: set tarpit not found, check: nft list ruleset' >&2
+fi
 
 # ---------------------------------------------------------------- systemd
 echo "== systemd -> $UNIT"
