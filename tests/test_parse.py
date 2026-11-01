@@ -43,11 +43,11 @@ def login_stream(name, protocol=776, host='127.0.0.1', port=25565, next_state=2)
     return packet
 
 
-def frame_ipv4(src_ip, payload, src_port=50000, seq=1000, dst_port=25565):
+def frame_ipv4(src_ip, payload, src_port=50000, seq=1000, dst_port=25565, flags=0x18):
     ip = b'\x45\x00' + struct.pack('>H', 20 + 20 + len(payload)) + b'\x00\x00\x00\x00'
     ip += b'\x40\x06\x00\x00'
     ip += socket.inet_aton(src_ip) + socket.inet_aton('192.168.0.19')
-    tcp = struct.pack('>HHII', src_port, dst_port, seq, 0) + b'\x50\x18\xff\xff\x00\x00\x00\x00'
+    tcp = struct.pack('>HHII', src_port, dst_port, seq, 0) + bytes([0x50, flags]) + b'\xff\xff\x00\x00\x00\x00'
     return struct.pack('>H', 0x0800) + b'\x00' * 18 + ip + tcp + payload
 
 
@@ -209,6 +209,42 @@ class FrameTests(unittest.TestCase):
         frame = bytearray(frame_ethernet('203.0.113.9', b'hello'))
         frame[14 + 20 + 12] = 0x30              # data offset 3, below the minimum
         self.assertIsNone(mc.packet_payload(mc.PCAP_LINKTYPE_EN10MB, bytes(frame), {25565}))
+
+
+class FlowTests(unittest.TestCase):
+    def frames(self, stream, src='203.0.113.9', seq=1000, chunk=20):
+        """A SYN followed by the client stream cut into TCP segments."""
+        out = [frame_ipv4(src, b'', seq=seq - 1, flags=mc.SYN_FLAG)]
+        for offset in range(0, len(stream), chunk):
+            out.append(frame_ipv4(src, stream[offset:offset + chunk], seq=seq + offset))
+        return out
+
+    def feed(self, tracker, frame):
+        return tracker.feed(mc.PCAP_LINKTYPE_SLL2, frame)
+
+    def test_without_a_syn_nothing_is_parsed(self):
+        tracker = mc.FlowTracker({25565})
+        for frame in self.frames(login_stream('nubik'))[1:]:
+            self.assertIsNone(self.feed(tracker, frame))
+
+    def test_one_decision_per_flow(self):
+        tracker = mc.FlowTracker({25565})
+        found = [d for d in (self.feed(tracker, frame)
+                             for frame in self.frames(login_stream('nubik'))) if d]
+        self.assertEqual(found, [('203.0.113.9', 2, 'nubik')])
+
+    def test_sequence_gap_aborts_the_flow(self):
+        tracker = mc.FlowTracker({25565})
+        frames = self.frames(login_stream('nubik'))
+        self.assertIsNone(self.feed(tracker, frames[0]))
+        self.assertIsNone(self.feed(tracker, frames[2]))    # frames[1] is missing
+        self.assertIsNone(self.feed(tracker, frames[1]))
+
+    def test_status_ping(self):
+        tracker = mc.FlowTracker({25565})
+        found = [d for d in (self.feed(tracker, frame)
+                             for frame in self.frames(login_stream('', next_state=1))) if d]
+        self.assertEqual(found, [('203.0.113.9', 1, None)])
 
 
 class ConfigTests(unittest.TestCase):

@@ -400,6 +400,68 @@ def read_pcap_frames(stream):
 
 
 # --------------------------------------------------------------------------
+# flow reassembly
+# --------------------------------------------------------------------------
+FLOW_TIMEOUT = 60
+FLOW_MAX_BYTES = 4096
+
+
+class FlowTracker:
+    """Rebuild the client byte stream of a flow and parse it once.
+
+    Only flows whose SYN was observed are tracked: packets of a session that
+    was already established when we started look like a handshake to a naive
+    parser and would block real players.
+    """
+
+    def __init__(self, ports, timeout=FLOW_TIMEOUT, max_bytes=FLOW_MAX_BYTES):
+        self.ports = ports
+        self.timeout = timeout
+        self.max_bytes = max_bytes
+        self.flows = {}
+
+    def feed(self, linktype, frame, now=None):
+        """(src, state, name) once a flow produced a decision, else None."""
+        packet = packet_payload(linktype, frame, self.ports)
+        if packet is None:
+            return None
+        src, src_port, seq, flags, payload = packet
+        now = now or time.time()
+        key = (src, src_port)
+
+        if flags & SYN_FLAG:
+            self.flows[key] = {'buf': bytearray(), 'seq': seq + 1,
+                               'at': now, 'done': False}
+            return None
+
+        flow = self.flows.get(key)
+        if flow is None:
+            return None
+        if now - flow['at'] > self.timeout:
+            del self.flows[key]
+            return None
+        flow['at'] = now
+        if flow['done'] or not payload:
+            return None
+
+        expected = flow['seq'] + len(flow['buf'])
+        if seq > expected:
+            flow['done'] = True        # gap: the stream is unusable
+            return None
+        if seq < expected:
+            return None                # a retransmission we already have
+
+        flow['buf'] += payload[:self.max_bytes - len(flow['buf'])]
+        state, name, raw = parse_client_stream(bytes(flow['buf']))
+        if state is None:
+            return None
+        flow['done'] = True
+        if raw:
+            log('raw %s name=%r %s' % (src, name, raw.hex()), 'debug')
+        return src, state, name
+
+
+# --------------------------------------------------------------------------
 # names and trusted IPs
 # --------------------------------------------------------------------------
 def names_path(cfg):
@@ -573,8 +635,7 @@ def watch(cfg):
     linktype = struct.unpack(endian + 'I', header[20:24])[0]
 
     decider = Decider(cfg)
-    ports = set(cfg['ports'])
-    flows = {}
+    tracker = FlowTracker(set(cfg['ports']))
     log('watching ports=%s mode=%s ping_policy=%s login_policy=%s linktype=%d trusted=%d'
         % (','.join(str(p) for p in cfg['ports']), cfg['mode'], cfg['ping_policy'],
            cfg['login_policy'], linktype, len(decider.trusted)))
@@ -588,51 +649,9 @@ def watch(cfg):
         if len(frame) < incl_len:
             break
 
-        packet = packet_payload(linktype, frame, ports)
-        if not packet:
-            continue
-        src, src_port, seq, flags, payload = packet
-        now = time.time()
-        key = (src, src_port)
-
-        # Only connections whose first packet (SYN) we saw are parsed. Packets
-        # of a session that was already established when we started look like
-        # handshakes to a naive parser and would block real players.
-        if flags & SYN_FLAG:
-            flows[key] = {'buf': bytearray(), 'seq': seq + 1,
-                          'at': now, 'done': False}
-            continue
-        flow = flows.get(key)
-        if flow is None:
-            continue
-        if now - flow['at'] > 60:
-            del flows[key]
-            continue
-        flow['at'] = now
-        if flow['done'] or not payload:
-            continue
-
-        expected = flow['seq'] + len(flow['buf'])
-        if seq == expected:
-            room = 4096 - len(flow['buf'])
-            flow['buf'] += payload[:room]
-        elif seq > expected:
-            flow['done'] = True
-            continue
-        else:
-            continue
-
-        state, name, raw = parse_client_stream(bytes(flow['buf']))
-        if state is None:
-            continue
-        flow['done'] = True
-        if raw:
-            log('raw %s name=%r %s' % (src, name, raw.hex()), 'debug')
-        decider.decide(src, state, name)
-
-        if len(flows) > 5000:
-            for stale in [k for k, v in flows.items() if now - v['at'] > 60]:
-                del flows[stale]
+        decision = tracker.feed(linktype, frame)
+        if decision:
+            decider.decide(*decision)
 
     return 0
 
@@ -644,37 +663,16 @@ def replay(cfg, path):
     # keep the output one line per connection: the summary below says enough
     setup_log(dict(log_only, log_level='warn'))
     decider = Decider(log_only)
-    ports = set(log_only['ports'])
+    tracker = FlowTracker(set(log_only['ports']))
     with open(path, 'rb') as fh:
         data = fh.read()
-    flows = {}
     for linktype, frame in read_pcap_frames(data):
-        packet = packet_payload(linktype, frame, ports)
-        if not packet:
+        decision = tracker.feed(linktype, frame)
+        if not decision:
             continue
-        src, src_port, seq, flags, payload = packet
-        now = time.time()
-        key = (src, src_port)
-        if flags & SYN_FLAG:
-            flows[key] = {'buf': bytearray(), 'seq': seq + 1, 'done': False}
-            continue
-        flow = flows.get(key)
-        if flow is None or flow['done']:
-            continue
-        expected = flow['seq'] + len(flow['buf'])
-        if seq == expected:
-            flow['buf'] += payload[:4096 - len(flow['buf'])]
-        elif seq > expected:
-            flow['done'] = True
-            continue
-        else:
-            continue
-        state, name, _ = parse_client_stream(bytes(flow['buf']))
-        if state is None:
-            continue
-        flow['done'] = True
-        decision = decider.decide(src, state, name)
-        print('%s %s%s' % (src, 'login ' + name if name else 'ping', ' -> ' + decision))
+        src, state, name = decision
+        print('%s %s%s' % (src, 'login ' + name if name else 'ping',
+                           ' -> ' + decider.decide(src, state, name)))
     return 0
 
 
@@ -738,19 +736,18 @@ def send_ping(cfg, host='127.0.0.1', port=None):
 # self-test
 # --------------------------------------------------------------------------
 def sll2_frame(ethertype, payload, src_ip=None, src_port=50000, seq=1000,
-               dst_ip='192.168.0.19'):
+               dst_ip='192.168.0.19', flags=0x18):
+    tcp_body = bytes([0x50, flags]) + b'\xff\xff\x00\x00\x00\x00'
     if ethertype == ETHERTYPE_IPV4:
         ip = b'\x45\x00' + struct.pack('>H', 20 + 20 + len(payload)) + b'\x00\x00\x00\x00'
         ip += b'\x40\x06\x00\x00'
         ip += socket.inet_aton(src_ip) + socket.inet_aton(dst_ip)
-        tcp = struct.pack('>HHII', src_port, 25565, seq, 0)
-        tcp += b'\x50\x18\xff\xff\x00\x00\x00\x00'
+        tcp = struct.pack('>HHII', src_port, 25565, seq, 0) + tcp_body
     else:
         ip = b'\x60\x00\x00\x00' + struct.pack('>H', 20 + len(payload)) + b'\x06\x40'
         ip += socket.inet_pton(socket.AF_INET6, src_ip)
         ip += socket.inet_pton(socket.AF_INET6, '2001:db8::1')
-        tcp = struct.pack('>HHII', src_port, 25565, seq, 0)
-        tcp += b'\x50\x18\xff\xff\x00\x00\x00\x00'
+        tcp = struct.pack('>HHII', src_port, 25565, seq, 0) + tcp_body
     return struct.pack('>H', ethertype) + b'\x00' * 18 + ip + tcp + payload
 
 
@@ -765,20 +762,22 @@ def selftest(cfg):
 
     pcap = b'\xd4\xc3\xb2\xa1' + b'\x02\x00\x04\x00' + b'\x00' * 8
     pcap += b'\xff\xff\x00\x00' + struct.pack('<I', PCAP_LINKTYPE_SLL2)
+    syn = sll2_frame(ETHERTYPE_IPV4, b'', src_ip='203.0.113.9', seq=999,
+                     flags=SYN_FLAG)
+    pcap += struct.pack('<IIII', 0, 0, len(syn), len(syn)) + syn
     for offset in (0, 20, 40):
         frame = sll2_frame(ETHERTYPE_IPV4, stream[offset:offset + 20],
                            src_ip='203.0.113.9', seq=1000 + offset)
         pcap += struct.pack('<IIII', 0, 0, len(frame), len(frame)) + frame
 
     ports = set(cfg['ports'])
-    reassembled = b''
+    tracker = FlowTracker(ports)
     name = None
     for linktype, frame in read_pcap_frames(pcap):
-        packet = packet_payload(linktype, frame, ports)
-        assert packet, 'frame was not parsed'
-        reassembled += packet[4]
-        _, name, _ = parse_client_stream(reassembled)
-        if name:
+        assert packet_payload(linktype, frame, ports), 'frame was not parsed'
+        decision = tracker.feed(linktype, frame)
+        if decision:
+            name = decision[2]
             break
     assert name == 'TestBot', 'expected TestBot, parsed %r' % (name,)
     print('ok: login start parse -> %r' % name)
