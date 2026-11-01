@@ -42,7 +42,10 @@ CHECK=0
 YES=0
 EXPECTED_SHA=""
 
-usage() { sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
+usage() {
+    awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
+    exit 0
+}
 
 while [ $# -gt 0 ]; do
     case "$1" in
