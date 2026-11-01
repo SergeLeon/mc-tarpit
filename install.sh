@@ -79,6 +79,7 @@ detect_server_dir() {
 }
 
 PORT_LIST=$(echo "$PORTS" | tr ',' ' ' | xargs)
+[ -n "$PORT_LIST" ] || { echo '--ports must not be empty' >&2; exit 1; }
 
 print_plan() {
     cat <<TXT
@@ -112,12 +113,12 @@ import sys
 
 path, table = sys.argv[1], sys.argv[2]
 try:
-    text = open(path).read()
+    text = open(path, encoding='utf-8').read()
 except OSError:
     sys.exit()
 new = re.sub(r'\ntable inet %s \{.*?\n\}\n?' % re.escape(table), '\n', text, flags=re.S)
 if new != text:
-    open(path, 'w').write(new)
+    open(path, 'w', encoding='utf-8').write(new)
     print('table block removed from', path)
 PY
     systemctl restart nftables 2>/dev/null || true
@@ -129,7 +130,7 @@ fi
 # ---------------------------------------------------------------- preflight
 echo '== checking prerequisites'
 missing=0
-for tool in nft tcpdump python3 curl tar; do
+for tool in nft tcpdump python3; do
     if command -v "$tool" >/dev/null; then
         printf '   %-8s %s\n' "$tool" "$(command -v "$tool")"
     else
@@ -137,7 +138,7 @@ for tool in nft tcpdump python3 curl tar; do
         missing=1
     fi
 done
-[ "$missing" = 0 ] || { echo "install the missing tools first (apt install nftables tcpdump python3 curl)" >&2; exit 1; }
+[ "$missing" = 0 ] || { echo "install the missing tools first (apt install nftables tcpdump python3)" >&2; exit 1; }
 
 if [ -z "$SERVER_DIR" ]; then
     if SERVER_DIR=$(detect_server_dir); then
@@ -160,6 +161,9 @@ fi
 # ---------------------------------------------------------------- sources
 HERE=$(cd "$(dirname "$0")" && pwd)
 if [ ! -f "$HERE/mc_tarpit.py" ] || [ ! -f "$HERE/contrib/nftables.conf" ]; then
+    for tool in curl tar; do
+        command -v "$tool" >/dev/null || { echo "$tool is needed to download the release" >&2; exit 1; }
+    done
     echo "== downloading $REPO/releases/latest/download/mc-tarpit.tar.gz"
     TMP=$(mktemp -d)
     trap 'rm -rf "$TMP"' EXIT
