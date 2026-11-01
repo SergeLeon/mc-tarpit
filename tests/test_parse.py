@@ -329,6 +329,25 @@ class TrustTests(unittest.TestCase):
         mc.save_trusted(cfg, loaded)
         self.assertNotIn('5.6.7.8', mc.load_trusted(cfg))
 
+    def test_unwritable_trust_file_is_reported_not_raised(self):
+        cfg = make_cfg(trust_file='missing/dir/tarpit-trusted.json')
+        self.assertFalse(mc.save_trusted(cfg, {'1.2.3.4': time.time() + 60}))
+
+
+class NftTests(unittest.TestCase):
+    def test_missing_nft_binary_is_fail_open(self):
+        cfg = make_cfg(mode='drop')
+        real = mc.subprocess.run
+
+        def missing(*args, **kwargs):
+            raise FileNotFoundError('nft')
+
+        mc.subprocess.run = missing
+        try:
+            self.assertFalse(mc.nft_add(cfg, 'tarpit', '203.0.113.9', '1d'))
+        finally:
+            mc.subprocess.run = real
+
 
 class NamesTests(unittest.TestCase):
     def test_whitelist_ops_and_extra(self):

@@ -533,12 +533,23 @@ def load_trusted(cfg):
 
 
 def save_trusted(cfg, data):
+    """Write the trusted list; a failure is logged, never raised.
+
+    The list lives next to the server and may be read-only for the user the
+    daemon runs as (the documented non-root setup); that must not take the
+    watcher down, the trust just does not survive a restart.
+    """
     path = trust_path(cfg)
     tmp = path + '.tmp'
-    with open(tmp, 'w', encoding='utf-8') as fh:
-        json.dump(data, fh, indent=2, sort_keys=True)
-        fh.write('\n')
-    os.replace(tmp, path)
+    try:
+        with open(tmp, 'w', encoding='utf-8') as fh:
+            json.dump(data, fh, indent=2, sort_keys=True)
+            fh.write('\n')
+        os.replace(tmp, path)
+        return True
+    except OSError as error:
+        log('cannot write %s: %s' % (path, error), 'warn')
+        return False
 
 
 def is_trusted(data, ip, now=None):
@@ -564,6 +575,15 @@ def nft_set_name(kind, ip):
     return kind + ('6' if ':' in ip else '')
 
 
+def subprocess_run(cmd):
+    """Run a helper command, or return None when it cannot even start."""
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True)
+    except OSError as error:
+        log('%s failed: %s' % (cmd[0], error), 'warn')
+        return None
+
+
 def ttl_seconds(ttl):
     """'15m' -> 900, a bare number is taken as seconds, junk gives 0."""
     text = str(ttl).strip().lower()
@@ -582,7 +602,9 @@ def nft_add(cfg, kind, ip, ttl):
     set_name = nft_set_name(kind, ip)
     cmd = ['nft', 'add', 'element', 'inet', cfg['table'], set_name,
            '{', ip, 'timeout', ttl, '}']
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess_run(cmd)
+    if result is None:
+        return False
     if result.returncode != 0:
         log('nft %s failed for %s: %s' % (set_name, ip, result.stderr.strip()), 'warn')
         return False
@@ -680,7 +702,11 @@ def tcpdump_filter(ports):
 def watch(cfg):
     cmd = ['tcpdump', '-i', cfg['iface'], '-n', '-s', '0', '-U',
            '-w', '-', tcpdump_filter(cfg['ports'])]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+    except OSError as error:
+        log('cannot start tcpdump: %s' % error, 'warn')
+        return 1
 
     header = proc.stdout.read(24)
     if len(header) < 24:
@@ -708,7 +734,8 @@ def watch(cfg):
         if decision:
             decider.decide(*decision)
 
-    return 0
+    log('tcpdump stopped, exiting', 'warn')
+    return 1
 
 
 def replay(cfg, path):
@@ -742,9 +769,10 @@ def show_status(cfg):
     for kind in ('tarpit', 'pingsink'):
         for family in ('', '6'):
             set_name = kind + family
-            result = subprocess.run(
-                ['nft', 'list', 'set', 'inet', cfg['table'], set_name],
-                capture_output=True, text=True)
+            result = subprocess_run(
+                ['nft', 'list', 'set', 'inet', cfg['table'], set_name])
+            if result is None:
+                return 1
             if result.returncode != 0:
                 continue
             print('%s:' % set_name)
