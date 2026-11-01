@@ -70,7 +70,7 @@ import subprocess
 import sys
 import time
 
-VERSION = '0.2.0'
+VERSION = '0.3.0'
 
 DEFAULTS = {
     'server_dir': '.',
