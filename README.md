@@ -22,8 +22,10 @@ login with a random nickname. This tool makes that pointless.
 - **Nickname tarpit** — a login with a name outside `whitelist.json`/`ops.json`
   puts the IP into an nftables set for a day; the client gets a timeout, not a
   rejection, so it cannot even confirm the server exists.
-- **Ping filter** — a status ping from an IP that never logged in with a known
-  nickname is dropped for 15 minutes, which keeps the server out of bot lists.
+- **Optional ping filter** — `ping_policy = sink` also blocks status pings from
+  addresses that never logged in with a known nickname, which keeps the server
+  out of bot lists. Off by default: a ping and a login share one port, so it
+  also costs the first join from a new address.
 - **Trusted players** — once an IP logs in with a whitelisted name it is trusted
   for 30 days, so its server-list pings keep working.
 - **No mods, no plugins, no proxy** — vanilla, Fabric, Paper, lazymc or plain.
@@ -70,18 +72,18 @@ sudo tee /etc/mc-tarpit.conf >/dev/null <<'CONF'
 [mc-tarpit]
 server_dir    = /home/mc/server
 ports         = 25565
-ping_policy   = sink
+ping_policy   = ignore
 login_policy  = tarpit
 trust_subnets = 192.168.0.0/24
 CONF
 sudo systemctl restart mc-tarpit
 ```
 
-Real output from a machine running this:
+Real output from a machine running this with `ping_policy = sink`:
 
 ```
 watching ports=25565 mode=drop ping_policy=sink login_policy=tarpit linktype=276 trusted=1
-ping 176.65.148.253 -> pingsink 15m (not trusted)
+ping 176.65.148.253 -> pingsink 1m (not trusted)
 login 45.153.34.119 name='iNHABITors74961' not-whitelisted
 tarpit 45.153.34.119 -> tarpit 1d
 ```
@@ -96,8 +98,9 @@ tarpit 45.153.34.119 -> tarpit 1d
 ## Limitations
 
 - **The first ping of a new IP is always answered** — the reply is already on
-  the wire when the sniffer sees the packet. Every following connection from
-  that IP is dropped.
+  the wire when the sniffer sees the packet. With `ping_policy = sink` every
+  following connection from that IP, including the join, is dropped until
+  `ping_ttl` expires.
 - **Trust is IP based.** A dynamic address means the server shows as offline in
   the multiplayer list until the next successful login.
 - **IPv6 extension headers are not followed** — such packets are ignored.

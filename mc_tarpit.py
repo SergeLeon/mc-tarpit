@@ -14,9 +14,14 @@ Decisions
     source IP matches trust_subnets            -> always allowed, ignored
     login, name in whitelist/ops/names file    -> allowed, IP trusted for trust_ttl
     login, unknown name                        -> tarpit set, tarpit_ttl
-    status ping, IP not trusted                -> pingsink set, ping_ttl
+    status ping, ping_policy = sink            -> pingsink set, ping_ttl
     login_policy = log                         -> unknown logins are only logged
     ping_policy  = ignore                      -> pings are never acted upon
+
+A status ping goes to the same port as a login and nftables cannot tell the
+two apart, so `ping_policy = sink` also drops the first join attempt of an
+address that has not logged in yet. That is why it is off by default: the
+nickname tarpit already catches the fleets that ping and then log in.
 
 Both IPv4 and IPv6 are supported, any number of ports, and the configuration
 can come from a file, the environment and the command line (in that order of
@@ -39,10 +44,10 @@ Configuration keys (config file, `MC_TARPIT_<KEY>` env, `--<key>` CLI):
     server_dir      dir with whitelist.json / ops.json      (default: .)
     ports           comma separated Minecraft ports         (default: 25565)
     mode            drop | log                              (default: drop)
-    ping_policy     sink | ignore                           (default: sink)
+    ping_policy     ignore | sink                           (default: ignore)
     login_policy    tarpit | log                            (default: tarpit)
     tarpit_ttl      nftables timeout for unknown logins     (default: 1d)
-    ping_ttl        nftables timeout for untrusted pings    (default: 15m)
+    ping_ttl        nftables timeout for untrusted pings    (default: 1m)
     trust_ttl       seconds an IP stays trusted             (default: 2592000)
     trust_file      trusted IP list, relative to server_dir (default: tarpit-trusted.json)
     names_file      extra allowed nicknames, one per line   (default: tarpit-names.txt)
@@ -71,10 +76,10 @@ DEFAULTS = {
     'server_dir': '.',
     'ports': '25565',
     'mode': 'drop',
-    'ping_policy': 'sink',
+    'ping_policy': 'ignore',
     'login_policy': 'tarpit',
     'tarpit_ttl': '1d',
-    'ping_ttl': '15m',
+    'ping_ttl': '1m',
     'trust_ttl': '2592000',
     'trust_file': 'tarpit-trusted.json',
     'names_file': 'tarpit-names.txt',

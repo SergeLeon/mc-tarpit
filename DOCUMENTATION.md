@@ -24,7 +24,7 @@ Handshake: id 0x00, protocol, address, port, next_state
 | login | unknown nickname, `login_policy=tarpit` | IP into `tarpit`/`tarpit6` for `tarpit_ttl` |
 | login | unknown nickname, `login_policy=log` | logged only |
 | ping | IP not trusted, `ping_policy=sink` | IP into `pingsink`/`pingsink6` for `ping_ttl` |
-| ping | `ping_policy=ignore` | logged at `debug` only |
+| ping | `ping_policy=ignore` (default) | logged at `debug` only |
 | garbage | handshake or login failed to parse | ignored (fail-open) |
 
 "Trusted" means the IP is present in `trust_file` (`{"<ip>": <unixtime>}`) and
@@ -42,10 +42,10 @@ The config file is INI, located with `--config PATH` or `MC_TARPIT_CONFIG`
 | `server_dir` | `.` | directory with `whitelist.json` and `ops.json` |
 | `ports` | `25565` | Minecraft ports, comma separated |
 | `mode` | `drop` | `drop` = real blocks, `log` = dry run |
-| `ping_policy` | `sink` | `sink` = block untrusted pings, `ignore` = leave pings alone |
+| `ping_policy` | `ignore` | `sink` = block untrusted pings, `ignore` = leave pings alone |
 | `login_policy` | `tarpit` | `tarpit` = block unknown logins, `log` = log only |
 | `tarpit_ttl` | `1d` | how long an unknown login blocks an IP |
-| `ping_ttl` | `15m` | how long an untrusted ping blocks an IP |
+| `ping_ttl` | `1m` | how long an untrusted ping blocks an IP |
 | `trust_ttl` | `2592000` | seconds an IP stays trusted after a known login |
 | `trust_file` | `tarpit-trusted.json` | trusted IP list, relative to `server_dir` |
 | `names_file` | `tarpit-names.txt` | extra allowed nicknames, one per line, `#` comments |
@@ -164,13 +164,21 @@ Log lines and what they mean:
 | `login IP name='X' ok` | known player, IP becomes trusted |
 | `login IP name='X' not-whitelisted` | unknown nickname |
 | `tarpit IP -> tarpit 1d` | blocked for an unknown login |
-| `ping IP -> pingsink 15m (not trusted)` | blocked for a ping from an untrusted IP |
+| `ping IP -> pingsink 1m (not trusted)` | blocked for a ping from an untrusted IP |
 | `ignore IP (trust_subnets)` | IP is inside a trusted subnet |
 | `nft tarpit failed for IP: ...` | no permission or no table — check `nft list ruleset` |
 
 Set contents are lost on reboot (rules and the trusted file survive). A player
 whose IP changed shows as offline in the multiplayer list until the next
-successful login; the login itself is checked by nickname and always works.
+successful login.
+
+**Why `ping_policy` is `ignore` by default.** A status ping and a login arrive
+on the same port, and nftables cannot look inside the TCP payload, so a
+`pingsink` drop drops the join attempt as well: an address that has not logged
+in yet cannot join until the entry expires. Set `ping_policy = sink` (and a
+short `ping_ttl`) only if staying out of bot server lists matters more than the
+first join from a new address; the nickname tarpit keeps catching the fleets
+that ping and then log in either way.
 
 ## 7. Protocol and parser limits
 

@@ -409,7 +409,7 @@ class DecisionTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
 
     def test_a_new_ping_window_reaches_nft_again(self):
-        cfg = make_cfg(mode='drop')
+        cfg = make_cfg(mode='drop', ping_policy='sink')
         calls = []
         real = mc.nft_add
         mc.nft_add = lambda *args: calls.append(args) or True
@@ -427,13 +427,19 @@ class DecisionTests(unittest.TestCase):
         self.assertEqual(decider.decide('203.0.113.9', 2, 'FishNet'), 'tarpit')
 
     def test_known_login_trusts(self):
-        cfg, decider = self.decider()
+        cfg, decider = self.decider(ping_policy='sink')
         self.assertEqual(decider.decide('203.0.113.9', 2, 'sergeleon'), 'allow')
         self.assertIn('203.0.113.9', mc.load_trusted(cfg))
         self.assertEqual(decider.decide('203.0.113.9', 1, None), 'allow')
 
-    def test_unknown_ping_sink(self):
+    def test_unknown_ping_is_ignored_by_default(self):
         _, decider = self.decider()
+        self.assertEqual(decider.decide('203.0.113.9', 1, None), 'ignore')
+        # the join right after the ping still gets through
+        self.assertEqual(decider.decide('203.0.113.9', 2, 'sergeleon'), 'allow')
+
+    def test_unknown_ping_sink(self):
+        _, decider = self.decider(ping_policy='sink')
         self.assertEqual(decider.decide('203.0.113.9', 1, None), 'pingsink')
 
     def test_ping_policy_ignore(self):
