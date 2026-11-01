@@ -630,17 +630,19 @@ def enforce(cfg, kind, ip, ttl, blocked, now):
 
     nftables refuses an element it already has ("File exists"), so a bot that
     keeps knocking would fork nft and log a warning on every packet. Remember
-    what was added recently instead.
+    what was added recently instead. A dry run keeps one line per decision:
+    that is what it is for.
     """
-    key = (nft_set_name(kind, ip), ip)
-    expiry = blocked.get(key)
-    if expiry is not None and expiry > now:
-        return False
-    if len(blocked) > BLOCK_CACHE_MAX:
-        for stale in [k for k, v in blocked.items() if v <= now]:
-            del blocked[stale]
-    blocked[key] = now + (ttl_seconds(ttl) or 60)
     set_name = nft_set_name(kind, ip)
+    if cfg['mode'] == 'drop':
+        key = (set_name, ip)
+        expiry = blocked.get(key)
+        if expiry is not None and expiry > now:
+            return False
+        if len(blocked) > BLOCK_CACHE_MAX:
+            for stale in [k for k, v in blocked.items() if v <= now]:
+                del blocked[stale]
+        blocked[key] = now + (ttl_seconds(ttl) or 60)
     if kind == 'tarpit':
         log('tarpit %s -> %s %s' % (ip, set_name, ttl))
     else:

@@ -408,6 +408,19 @@ class DecisionTests(unittest.TestCase):
             mc.nft_add = real
         self.assertEqual(len(calls), 1)
 
+    def test_log_mode_keeps_every_decision(self):
+        cfg = make_cfg(mode='log')
+        calls = []
+        real = mc.nft_add
+        mc.nft_add = lambda *args: calls.append(args) or True
+        try:
+            decider = mc.Decider(cfg)
+            for _ in range(3):
+                self.assertEqual(decider.decide('203.0.113.9', 2, 'FishNet'), 'tarpit')
+        finally:
+            mc.nft_add = real
+        self.assertEqual(len(calls), 3)
+
     def test_a_new_ping_window_reaches_nft_again(self):
         cfg = make_cfg(mode='drop', ping_policy='sink')
         calls = []
