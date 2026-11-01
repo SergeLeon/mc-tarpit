@@ -102,8 +102,13 @@ PCAP_LINKTYPE_SLL = 113
 PCAP_LINKTYPE_SLL2 = 276
 ETHERTYPE_IPV4 = 0x0800
 ETHERTYPE_IPV6 = 0x86DD
+ETHERTYPE_VLAN = 0x8100
+ETHERTYPE_QINQ = 0x88A8
 TCP_PROTO = 6
 SYN_FLAG = 0x02
+IPV4_HEADER = 20
+IPV6_HEADER = 40
+TCP_HEADER = 20
 
 STATE = {'level': 1, 'file': ''}
 
@@ -216,6 +221,7 @@ def describe_config(cfg):
 # Minecraft protocol
 # --------------------------------------------------------------------------
 def read_varint(buf, pos):
+    """Read a Minecraft varint: at most five bytes (32 bit)."""
     value = 0
     shift = 0
     while True:
@@ -227,7 +233,7 @@ def read_varint(buf, pos):
         if not byte & 0x80:
             return value, pos
         shift += 7
-        if shift > 35:
+        if shift > 28:
             return None, pos
 
 
@@ -297,45 +303,70 @@ def handshake(next_state, host, port, protocol):
 # packet parsing
 # --------------------------------------------------------------------------
 def _transport_offset(linktype, frame):
-    """Return (ethertype, ip_offset) for a frame, or (None, 0)."""
+    """Return (ethertype, ip_offset) for a frame, or (None, 0).
+
+    Ethernet frames may carry VLAN / QinQ tags, so the ethertype is read where
+    it actually is instead of assuming it sits at a fixed offset.
+    """
     if linktype == PCAP_LINKTYPE_SLL2:
         if len(frame) < 22:
             return None, 0
         return struct.unpack('>H', frame[0:2])[0], 20
-    if linktype == PCAP_LINKTYPE_EN10MB:
-        if len(frame) < 14:
-            return None, 0
-        return struct.unpack('>H', frame[12:14])[0], 14
     if linktype == PCAP_LINKTYPE_SLL:
         if len(frame) < 16:
             return None, 0
         return struct.unpack('>H', frame[14:16])[0], 16
+    if linktype == PCAP_LINKTYPE_EN10MB:
+        if len(frame) < 14:
+            return None, 0
+        ethertype = struct.unpack('>H', frame[12:14])[0]
+        offset = 14
+        while ethertype in (ETHERTYPE_VLAN, ETHERTYPE_QINQ):
+            if len(frame) < offset + 4:
+                return None, 0
+            ethertype = struct.unpack('>H', frame[offset + 2:offset + 4])[0]
+            offset += 4
+        return ethertype, offset
     return None, 0
 
 
 def packet_payload(linktype, frame, ports):
     """(src_ip, src_port, seq, flags, payload) for TCP to one of our ports.
 
+    Every length in the headers is checked before it is used, because a frame
+    from a hostile peer is just bytes: anything inconsistent returns None and
+    the packet is ignored (fail-open).
+
     IPv6 extension headers are not followed: a packet with one is ignored.
     """
     ethertype, offset = _transport_offset(linktype, frame)
     if ethertype == ETHERTYPE_IPV4:
         ip = frame[offset:]
-        if len(ip) < 20 or (ip[0] >> 4) != 4 or ip[9] != TCP_PROTO:
+        if len(ip) < IPV4_HEADER or (ip[0] >> 4) != 4 or ip[9] != TCP_PROTO:
             return None
         header_len = (ip[0] & 0x0F) * 4
+        if header_len < IPV4_HEADER or header_len > len(ip):
+            return None
+        # the total length trims the ethernet padding of a short frame
+        total = struct.unpack('>H', ip[2:4])[0]
+        if total < header_len + TCP_HEADER:
+            return None
         src_ip = socket.inet_ntoa(ip[12:16])
-        tcp = ip[header_len:]
+        tcp = ip[header_len:min(total, len(ip))]
     elif ethertype == ETHERTYPE_IPV6:
         ip = frame[offset:]
-        if len(ip) < 40 or (ip[0] >> 4) != 6 or ip[6] != TCP_PROTO:
+        if len(ip) < IPV6_HEADER or (ip[0] >> 4) != 6 or ip[6] != TCP_PROTO:
             return None
+        payload_len = struct.unpack('>H', ip[4:6])[0]
+        end = IPV6_HEADER + payload_len
+        if payload_len == 0 or end > len(ip):
+            end = len(ip)      # jumbogram or truncated capture
         src_ip = socket.inet_ntop(socket.AF_INET6, ip[8:24])
-        tcp = ip[40:]
+        tcp = ip[IPV6_HEADER:end]
     else:
         return None
 
-    if len(tcp) < 20:
+    if len(tcp) < TCP_HEADER:
         return None
     src_port, dst_port = struct.unpack('>HH', tcp[0:4])
     if dst_port not in ports:
@@ -343,6 +374,8 @@ def packet_payload(linktype, frame, ports):
     seq = struct.unpack('>I', tcp[4:8])[0]
     flags = tcp[13]
     data_offset = (tcp[12] >> 4) * 4
+    if data_offset < TCP_HEADER or data_offset > len(tcp):
+        return None
     return src_ip, src_port, seq, flags, tcp[data_offset:]
 
 

@@ -59,6 +59,18 @@ def frame_ipv6(src_ip, payload, src_port=50000, seq=1000, dst_port=25565):
     return struct.pack('>H', 0x86DD) + b'\x00' * 18 + ip + tcp + payload
 
 
+def frame_ethernet(src_ip, payload, vlan=False, dst_port=25565):
+    ip = b'\x45\x00' + struct.pack('>H', 20 + 20 + len(payload)) + b'\x00\x00\x00\x00'
+    ip += b'\x40\x06\x00\x00'
+    ip += socket.inet_aton(src_ip) + socket.inet_aton('192.168.0.19')
+    tcp = struct.pack('>HHII', 50000, dst_port, 1000, 0) + b'\x50\x18\xff\xff\x00\x00\x00\x00'
+    header = b'\xaa' * 6 + b'\xbb' * 6
+    if vlan:
+        header += struct.pack('>HH', mc.ETHERTYPE_VLAN, 100)
+    header += struct.pack('>H', mc.ETHERTYPE_IPV4)
+    return header + ip + tcp + payload
+
+
 class VarIntTests(unittest.TestCase):
     def test_zero(self):
         self.assertEqual(mc.encode_varint(0), b'\x00')
@@ -72,6 +84,15 @@ class VarIntTests(unittest.TestCase):
 
     def test_truncated(self):
         value, _ = mc.read_varint(b'\x80', 0)
+        self.assertIsNone(value)
+
+    def test_five_bytes_is_the_limit(self):
+        value, pos = mc.read_varint(b'\xff\xff\xff\xff\x0f', 0)
+        self.assertEqual(value, 0xFFFFFFFF)
+        self.assertEqual(pos, 5)
+
+    def test_six_bytes_rejected(self):
+        value, _ = mc.read_varint(b'\xff\xff\xff\xff\xff\x0f', 0)
         self.assertIsNone(value)
 
 
@@ -153,6 +174,41 @@ class FrameTests(unittest.TestCase):
         self.assertEqual(mc.nft_set_name('tarpit', '203.0.113.9'), 'tarpit')
         self.assertEqual(mc.nft_set_name('tarpit', '2001:db8::42'), 'tarpit6')
         self.assertEqual(mc.nft_set_name('pingsink', '2001:db8::42'), 'pingsink6')
+
+    def test_ethernet_frame(self):
+        packet = mc.packet_payload(mc.PCAP_LINKTYPE_EN10MB,
+                                   frame_ethernet('203.0.113.9', b'hello'), {25565})
+        self.assertEqual(packet[0], '203.0.113.9')
+        self.assertEqual(packet[4], b'hello')
+
+    def test_vlan_tag_is_skipped(self):
+        frame = frame_ethernet('203.0.113.9', b'hello', vlan=True)
+        packet = mc.packet_payload(mc.PCAP_LINKTYPE_EN10MB, frame, {25565})
+        self.assertIsNotNone(packet)
+        self.assertEqual(packet[0], '203.0.113.9')
+        self.assertEqual(packet[4], b'hello')
+
+    def test_bad_ipv4_header_length_rejected(self):
+        for ihl in (0, 4, 15):
+            frame = bytearray(frame_ethernet('203.0.113.9', b'hello'))
+            frame[14] = 0x40 | ihl          # version 4, ihl from the loop
+            self.assertIsNone(mc.packet_payload(mc.PCAP_LINKTYPE_EN10MB, bytes(frame), {25565}))
+
+    def test_bad_total_length_rejected(self):
+        frame = bytearray(frame_ethernet('203.0.113.9', b'hello'))
+        frame[16:18] = struct.pack('>H', 20)   # less than one TCP header
+        self.assertIsNone(mc.packet_payload(mc.PCAP_LINKTYPE_EN10MB, bytes(frame), {25565}))
+
+    def test_ethernet_padding_is_trimmed(self):
+        frame = frame_ethernet('203.0.113.9', b'hi')
+        frame += b'\x00' * 18                   # padding to the 60 byte minimum
+        packet = mc.packet_payload(mc.PCAP_LINKTYPE_EN10MB, frame, {25565})
+        self.assertEqual(packet[4], b'hi')
+
+    def test_bad_tcp_header_length_rejected(self):
+        frame = bytearray(frame_ethernet('203.0.113.9', b'hello'))
+        frame[14 + 20 + 12] = 0x30              # data offset 3, below the minimum
+        self.assertIsNone(mc.packet_payload(mc.PCAP_LINKTYPE_EN10MB, bytes(frame), {25565}))
 
 
 class ConfigTests(unittest.TestCase):
