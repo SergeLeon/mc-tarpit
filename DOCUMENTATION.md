@@ -99,6 +99,8 @@ Installer flags:
 | `--ports LIST` | comma separated Minecraft ports (default `25565`) |
 | `--trust IP` | trust an IP right away, repeatable |
 | `--trust-subnets CIDR` | subnets that are never blocked |
+| `--tarpit-ttl T` | how long an unknown login stays blocked (default `1d`) |
+| `--ping-ttl T` | how long an untrusted ping stays blocked (default `1m`) |
 | `--table NAME` | nftables table name (default `mc_tarpit`) |
 | `--config PATH` | where to write the config (default `/etc/mc-tarpit.conf`) |
 | `--check` | print the plan and exit, change nothing |
@@ -107,11 +109,13 @@ Installer flags:
 | `--yes` | do not ask for confirmation |
 | `--uninstall` | remove everything except the trusted IP list |
 
-The installer is idempotent: a second run updates the script, config, ports and
-unit, and keeps timestamped backups of `/etc/nftables.conf` and
-`/etc/mc-tarpit.conf`. When it runs without local sources it downloads
-`mc-tarpit.tar.gz` from the latest release, prints its sha256 and verifies it
-when `--sha256` is given.
+The installer is idempotent: a second run updates the script and the unit, and
+rewrites only the config keys that were passed on the command line — an
+existing `/etc/mc-tarpit.conf` is kept otherwise, with a timestamped backup
+next to it, so hand-tuned values survive. It also leaves the contents of the
+`tarpit`/`pingsink` sets alone instead of reloading the whole ruleset. When it
+runs without local sources it downloads `mc-tarpit.tar.gz` from the latest
+release, prints its sha256 and verifies it when `--sha256` is given.
 
 ## 5. Environments
 
@@ -196,7 +200,8 @@ that ping and then log in either way.
 - IPv6 extension headers are not followed; such packets are ignored
   (fail-open, no false blocks).
 - Reassembly is bounded: a sequence gap aborts the flow, buffer up to 4 KB,
-  a flow expires after 60 seconds.
+  a flow expires after 60 seconds, and the table holds at most 8192 flows
+  (the oldest is evicted first, so a SYN flood cannot grow it).
 
 ## 8. Security
 
