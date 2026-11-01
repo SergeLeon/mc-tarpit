@@ -115,8 +115,8 @@ when `--sha256` is given.
 
 ## 5. Environments
 
-**systemd** (default): the unit reads `/etc/mc-tarpit.conf`, `Restart=always`,
-logs to the journal.
+**systemd** (default): the unit reads `/etc/mc-tarpit.conf`, runs with
+`Restart=on-failure` (five attempts per 300 s), logs to the journal.
 
 **tmux / container / no systemd**:
 
@@ -136,10 +136,14 @@ host, all players arrive from the proxy address — put it into `trust_subnets` 
 run mc-tarpit on the proxy itself. A local proxy (lazymc on the same host)
 needs no configuration: the sniffer sees the real client IPs.
 
-**Without root**: create a `mc-tarpit` user, give it write access to the
-directory holding `trust_file`, and use the commented `User=mc-tarpit` +
-`AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN` block in
-`contrib/mc-tarpit.service`.
+**Without root**: create a `mc-tarpit` user, give it read access to the server
+directory and write access to the directory that holds `trust_file`, then use
+the commented block in `contrib/mc-tarpit.service`: `User=mc-tarpit`,
+`AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN`, `NoNewPrivileges=yes`,
+`ProtectSystem=full` and `ReadWritePaths=<server_dir>`. Without that last line
+`ProtectSystem=full` makes the server directory read-only and the trusted list
+cannot be written — the daemon keeps running and logs a warning per login, but
+trust is then lost on every restart.
 
 **Before going live**: `mode = log` (or `--mode log`) prints decisions and
 blocks nothing; `replay` does the same offline for a saved capture.
