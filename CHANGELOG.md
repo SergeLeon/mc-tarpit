@@ -5,6 +5,8 @@ versioning: [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-02
+
 ### Added
 
 - `install.sh --tarpit-ttl` and `--ping-ttl`, so a reinstall no longer resets
@@ -93,7 +95,8 @@ versioning: [SemVer](https://semver.org/).
 - systemd unit, nftables table and `install.sh`.
 - `ping`/`login` test clients and `selftest`.
 
-[Unreleased]: https://github.com/SergeLeon/minecraft-antibot-tarpit/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/SergeLeon/minecraft-antibot-tarpit/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/SergeLeon/minecraft-antibot-tarpit/releases/tag/v0.3.0
 [0.2.1]: https://github.com/SergeLeon/minecraft-antibot-tarpit/releases/tag/v0.2.1
 [0.2.0]: https://github.com/SergeLeon/minecraft-antibot-tarpit/releases/tag/v0.2.0
 [0.1.0]: https://github.com/SergeLeon/minecraft-antibot-tarpit/releases/tag/v0.1.0
